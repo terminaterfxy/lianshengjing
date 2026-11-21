@@ -24,6 +24,8 @@ import { MicListener } from "../../mic/formants.ts";
 import { QUIET, type Heard, type Kind } from "../../mic/track.ts";
 import { MicSession } from "../../mic/session.ts";
 import { RangeRecorder } from "../../mic/range.ts";
+import { findBreaks, GlideRecorder } from "../../mic/register.ts";
+import { RegisterCard, type GlideState } from "./RegisterCard.tsx";
 import { midiOf, MIN_FPS, noteOf, type NoteReading, type Vibrato } from "../../mic/pitch.ts";
 import { applyAffine, CalibrationRun, calibrationProblem, fitAffine, loadCalibration, REFS, saveCalibration, type Affine, type Calibration } from "../../mic/calibrate.ts";
 import type { VoiceModel } from "../analysis.ts";
@@ -298,6 +300,9 @@ export function MicPage() {
   rangeRef.current = range;
   const [ranging, setRanging] = useState<[number, number] | null>(null);
   const rangeRun = useRef<RangeRecorder | null>(null);
+  // a glide recorded for its register breaks: in progress, or what it read
+  const [glide, setGlide] = useState<GlideState | null>(null);
+  const glideRun = useRef<GlideRecorder | null>(null);
   const sessionRef = useRef<MicSession | null>(null);
   // the breath under the note in progress (or the last one), and how that note began
   const [steady, setSteady] = useState<Steadiness | null>(null);
@@ -433,6 +438,7 @@ export function MicPage() {
     let sentF0 = 0, sentBreath = -1, sentVoiced = true;
     const session = new MicSession();
     session.ranging = rangeRun.current;
+    session.gliding = glideRun.current;
     sessionRef.current = session;
     // the fallback's own pose (no engine): eased here, tip and all
     const pose: Record<string, number> = { ...useStore.getState().artic };
@@ -602,6 +608,13 @@ export function MicPage() {
         setPitchLive(session.pitch.noteLive);
         const r = rangeRun.current;
         if (r && r.hi > 0) setRanging([r.lo, r.hi]);
+        // a glide: over once she stops (the recorder decides), or its notes so far
+        const g = glideRun.current;
+        if (g?.done) finishGlide();
+        else if (g && g.points.length >= 5) {
+          const ms = g.points.map((p) => p.midi).sort((p, q) => p - q);
+          setGlide({ recording: true, lo: ms[Math.floor(ms.length * 0.05)], hi: ms[Math.floor(ms.length * 0.95)] });
+        }
       }
     };
     raf = requestAnimationFrame(loop);
@@ -627,9 +640,10 @@ export function MicPage() {
     if (on) {
       run.current = null;
       setCalStep(null);
-      // a breath still going when she stops counts as ended here
+      // a breath still going when she stops counts as ended here, and so does a glide
       const s = sessionRef.current;
       if (s?.breathSounding) keepBreath(s.steady);
+      finishGlide();
       listener.stop();
       st.setHold(false);
       setOn(false);
@@ -709,6 +723,27 @@ export function MicPage() {
     rangeRun.current = new RangeRecorder();
     if (sessionRef.current) sessionRef.current.ranging = rangeRun.current;
     setRanging([0, 0]);
+  };
+  /** Record a glide for its register breaks (the microphone starts first if it isn't on), or finish it now. */
+  const recordGlide = async () => {
+    if (glideRun.current) {
+      finishGlide();
+      return;
+    }
+    if (!on && !(await toggle())) return;
+    glideRun.current = new GlideRecorder();
+    if (sessionRef.current) sessionRef.current.gliding = glideRun.current;
+    setGlide({ recording: true, lo: null, hi: null });
+  };
+  /** The glide in progress, read (when there is one). */
+  const finishGlide = () => {
+    const r = glideRun.current;
+    if (!r) return;
+    glideRun.current = null;
+    const s = sessionRef.current;
+    if (s) s.gliding = null;
+    const voice = s?.voice ?? "female", sampleRate = mic.current?.sampleRate || 48000;
+    setGlide({ recording: false, glide: r.span >= 1.5 ? findBreaks(r.points, voice, sampleRate) : null, span: r.span, fps: r.span > 0 ? r.points.length / r.span : 0, sampleRate, voice });
   };
   const forgetRange = () => {
     try {
@@ -1010,6 +1045,7 @@ export function MicPage() {
                 )}
               </div>
             </section>
+            <RegisterCard state={glide} on={on} onRecord={() => void recordGlide()} />
             <details className="mic-help">
               <summary>怎么看</summary>
               <ul>
@@ -1021,6 +1057,9 @@ export function MicPage() {
                 </li>
                 <li>
                   <b>声带拉长</b>：唱高音主要靠把声带拉长、拉薄。拉了多长从声音里量不出来，这里是按音高换算的：以音域的最低音为起点，到最高音大约长出一半。默认按女声 / 男声 / 童声的常见音域算；点“录我的音域”，从最低音唱到最高音，之后就按你本人的音域算。
+                </li>
+                <li>
+                  <b>换声区（实验性）</b>：从低往高滑的时候，嗓音从“真声”换到“头声 / 假声”的地方常会突然变：音高一下跳上去（破音），或者声带闭合一下变松、音量一下变小。这里只找“突然”的变化，慢慢变过去的（过渡得好）不标。下面的图横轴是音高，绿线是闭合，蓝线是音量，黄色虚线是突变的位置。用模拟器造的滑音检验过：故意在某个音突然变的，标出的位置误差在半个半音以内；一路平滑或慢慢变薄的不会误标，加了混响和噪声也一样。但模拟器并不会真的换声区，真人嗓音上没有验证过，只作参考。请用“啊”滑，一口气 3–6 秒滑完。闭合只在检验过的音高范围里看（女声 F3–C♯5，男声 G2–D♯4），之外和用蓝牙耳机时只看音高有没有突然跳。
                 </li>
               </ul>
             </details>

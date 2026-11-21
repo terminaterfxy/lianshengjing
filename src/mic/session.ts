@@ -2,7 +2,8 @@
  * Everything the mic page reads off a voice, frame by frame, in one place and with no browser in
  * it: what kind of sound it is and its vowel (SoundTracker), how the folds close (glottis.ts), the
  * breath under the note and how the note began (breath.ts), the note's pitch and vibrato
- * (pitch.ts), how bright it is (tone.ts), and a range being recorded (range.ts).
+ * (pitch.ts), how bright it is (tone.ts), a range being recorded (range.ts) and a glide recorded
+ * for its register breaks (register.ts).
  * The page feeds it the microphone; `tools/mic-selftest.ts` feeds it rendered audio at a fixed
  * frame rate, so what is tested is what runs.
  */
@@ -13,6 +14,7 @@ import { analyseOnset, BreathTracker, type Onset, type Steadiness } from "./brea
 import { RangeRecorder } from "./range.ts";
 import { PitchTracker } from "./pitch.ts";
 import { bandPowers, ToneTracker } from "./tone.ts";
+import { GlideRecorder } from "./register.ts";
 
 export interface Frame {
   fr: MicFrame;
@@ -51,6 +53,8 @@ export class MicSession {
   onset: Onset | null = null;
   /** a range being recorded, or null */
   ranging: RangeRecorder | null = null;
+  /** a glide being recorded for its register breaks, or null */
+  gliding: GlideRecorder | null = null;
   /** how many breaths have ended, and the last one that did (for the history) */
   breathsEnded = 0;
   endedBreath: Steadiness | null = null;
@@ -83,7 +87,8 @@ export class MicSession {
 
     // the folds: this frame's estimate, then the median of the last half second (on a display
     // too slow to give three frames in that, of the last three)
-    if (kind === "vowel" && glottal && fr.voiced) this.oqs.push({ t: now, v: openQuotient(glottal, fr.f0, fr.level - this.tracker.floor, this.voice), db: fr.level });
+    let oqNow: number | null = null;
+    if (kind === "vowel" && glottal && fr.voiced) this.oqs.push({ t: now, v: (oqNow = openQuotient(glottal, fr.f0, fr.level - this.tracker.floor, this.voice)), db: fr.level });
     else if (kind === "silence") this.oqs.length = 0;
     while (this.oqs.length > 3 && now - this.oqs[0].t > 500) this.oqs.shift();
     while (this.oqs.length && now - this.oqs[0].t > 2000) this.oqs.shift();
@@ -113,6 +118,8 @@ export class MicSession {
     }
 
     this.ranging?.feed(now, voiced && fr.voiced && fr.clarity >= 0.8 ? fr.f0 : 0);
+    // a glide's frames one by one (a step in them is what it looks for: no half-second median)
+    this.gliding?.feed(now, voiced && fr.voiced && fr.clarity >= 0.8 ? fr.f0 : 0, oqNow === null ? null : 100 * (1 - oqNow), fr.level);
     this.pitch.feed(now, voiced && fr.voiced ? fr.f0 : 0);
     this.tone.feed(now, voiced && fr.voiced ? f.bands : null);
     return h;

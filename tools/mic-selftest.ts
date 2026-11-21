@@ -2,7 +2,7 @@
  * Self-test of the mic page's readings (src/mic): the engine renders sounds whose answers are
  * known, and they are played to the same MicSession the page runs, frame by frame.
  *
- *   cargo build --release -p chimera-cli && cargo build --release -p chimera --example glottis_sweep --example brightness_sweep
+ *   cargo build --release -p chimera-cli && cargo build --release -p chimera --example glottis_sweep --example brightness_sweep --example register_glide
  *   node tools/mic-selftest.ts
  *
  * What it checks: vowel formants, calibration to another voice, which sounds are recognised, the
@@ -26,10 +26,11 @@ import { noteOf, PitchTracker } from "../src/mic/pitch.ts";
 import { addRecord, byDay, parseRecords, recordOf, type BreathRecord } from "../src/mic/history.ts";
 import { bandPowers, brightnessOf, N_BANDS } from "../src/mic/tone.ts";
 import { findClicks, findOnsets, score } from "../src/mic/rhythm.ts";
+import { findBreaks, GlideRecorder } from "../src/mic/register.ts";
 import { initChimera, call } from "../src/wasm/chimera.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const cli = join(root, "target/release/chimera"), sweep = join(root, "target/release/examples/glottis_sweep"), brightSweep = join(root, "target/release/examples/brightness_sweep");
+const cli = join(root, "target/release/chimera"), sweep = join(root, "target/release/examples/glottis_sweep"), brightSweep = join(root, "target/release/examples/brightness_sweep"), regSweep = join(root, "target/release/examples/register_glide");
 const tmp = mkdtempSync(join(tmpdir(), "chimera-mic-"));
 let failed = 0;
 const check = (name: string, ok: boolean, detail: string) => {
@@ -633,6 +634,60 @@ try {
     // the score: early, late, a miss, a stray syllable, two on one beat
     const sc = score([0.47, 1.05, 2.5, 3.02, 3.08].map((t) => t + 0.05), [0.5, 1, 1.5, 2, 3], 0.05);
     check("rhythm, the score", sc.offsets.map((o) => (o === null ? "-" : Math.round(o))).join() === "-30,50,-,-,20" && sc.hit === 3 && sc.extra === 2 && Math.round(sc.mean!) === 13, `offsets ${sc.offsets.map((o) => (o === null ? "-" : Math.round(o))).join(" ")} ms, ${sc.hit} hit, ${sc.extra} extra, mean ${sc.mean?.toFixed(0)} ms`);
+  }
+  // ---- register breaks: the engine's glides, smooth, thinning gradually, thinning suddenly, cracking
+  console.log("\nregister");
+  {
+    type Rec = { vowel: string; secs: number; scenario: string; brk: number | null; jump: number; offset: number; len: number };
+    const glides = (voice: "female" | "male") => {
+      const dir = join(tmp, `glide-${voice}`);
+      execFileSync(regSweep, [dir, voice, "mini"], { stdio: "ignore" });
+      const recs = JSON.parse(readFileSync(join(dir, "sweep.json"), "utf8")) as Rec[];
+      const buf = readFileSync(join(dir, "sweep.f32"));
+      const all = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4).slice();
+      rmSync(dir, { recursive: true, force: true });
+      return { recs, all };
+    };
+    // a glide heard as the page hears it: room noise around it, `fps` frames a second, at 48 or 16 kHz
+    const hear = (clip: Float32Array, voice: "female" | "male", fps: number, sr: number) => {
+      let x: Float32Array = new Float32Array(clip.length + 48000);
+      for (let i = 0; i < x.length; i++) x[i] = (rnd() - 0.5) * 2e-4;
+      for (let i = 0; i < clip.length; i++) x[9600 + i] += clip[i];
+      if (sr === 16000) x = decimate(x, 3);
+      const s = new MicSession();
+      s.voice = voice;
+      const g = (s.gliding = new GlideRecorder());
+      replay(s, x, sr, fps);
+      return { done: g.done, glide: findBreaks(g.points, voice, sr) };
+    };
+    const midiOf = (hz: number) => 69 + 12 * Math.log2(hz / 440);
+    for (const voice of ["female", "male"] as const) {
+      const { recs, all } = glides(voice);
+      for (const [fps, sr] of voice === "female" ? [[60, 48000], [30, 48000], [60, 16000]] : [[60, 48000]]) {
+        const res = recs.map((r) => ({ r, ...hear(all.subarray(r.offset, r.offset + r.len), voice, fps, sr) }));
+        const calm = res.filter((q) => !q.r.brk), sudden = res.filter((q) => q.r.brk && !q.r.jump), cracks = res.filter((q) => q.r.jump);
+        const tag = `${voice === "female" ? "a woman" : "a man"}, ${fps} frames a second${sr === 16000 ? ", 16 kHz" : ""}`;
+        const where = (q: (typeof res)[number]) => q.glide?.breaks.map((b) => `${noteOf(Math.round(b.midi))}${b.jump !== null ? ` ↑${b.jump.toFixed(1)}` : ""}`).join(",") || "none";
+        check(`register, smooth and gradually thinning glides (${tag})`, calm.every((q) => q.done && q.glide !== null && q.glide.breaks.length === 0), calm.map(where).join(" | ") + " (none)");
+        if (sr >= 32000) check(`register, the folds thinning within 40 ms (${tag})`, sudden.every((q) => q.glide?.breaks.length === 1 && q.glide.breaks[0].jump === null && Math.abs(q.glide.breaks[0].midi - midiOf(q.r.brk!)) <= 1), `${sudden.map((q) => `${where(q)} (${noteOf(Math.round(midiOf(q.r.brk!)))})`).join(" | ")}`);
+        else check(`register, the folds thinning, at 16 kHz: not looked for`, sudden.every((q) => q.glide?.breaks.length === 0), sudden.map(where).join(" | ") + " (none)");
+        check(`register, a crack of 3 semitones (${tag})`, cracks.every((q) => q.glide?.breaks.length === 1 && q.glide.breaks[0].jump !== null && Math.abs(q.glide.breaks[0].jump - q.r.jump) <= 0.5 && Math.abs(q.glide.breaks[0].midi - midiOf(q.r.brk!)) <= 1), `${cracks.map((q) => `${where(q)} (${noteOf(Math.round(midiOf(q.r.brk!)))} ↑3)`).join(" | ")}`);
+      }
+    }
+    // the recorder: a try under 1.5 s is forgotten at the pause after it; a glide ends 0.7 s into the one after
+    const g = new GlideRecorder();
+    let t = 0;
+    const sing = (secs: number, f0: number) => {
+      for (const end = t + secs * 1000; t < end; t += 16.7) g.feed(t, f0, 40, -20);
+    };
+    sing(1, 220);
+    sing(0.8, 0);
+    const forgot = g.points.length === 0 && !g.done;
+    sing(2, 330);
+    sing(0.5, 0);
+    const notYet = !g.done;
+    sing(0.3, 0);
+    check("register, the recorder's start and end", forgot && notYet && g.done && Math.abs(g.span - 2) < 0.05, `a 1 s try ${forgot ? "forgotten" : "kept"}; a 2 s glide ${notYet ? "still open" : "closed"} 0.5 s after, ${g.done ? "closed" : "open"} at 0.8 s, ${g.span.toFixed(2)} s long`);
   }
 } finally {
   rmSync(tmp, { recursive: true, force: true });

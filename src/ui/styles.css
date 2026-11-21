@@ -3323,3 +3323,17 @@ html.in-browser .resize-grip {
   min-width: 0;
   box-sizing: border-box;
 }
+
+/* the register card: an "experimental" tag by its title, and the glide's chart */
+.mic-tag {
+  font-size: 12px;
+  color: var(--amber, #ffb340);
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  padding: 0 5px;
+  line-height: 18px;
+}
+
+.mic-glide .screen-body {
+  height: 200px;
+}
