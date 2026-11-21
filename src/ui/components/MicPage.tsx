@@ -31,6 +31,7 @@ import type { Onset, OnsetKind, Steadiness } from "../../mic/breath.ts";
 import { addRecord, parseRecords, recordOf, type BreathRecord } from "../../mic/history.ts";
 import { BreathHistory, sdWord } from "./BreathHistory.tsx";
 import { ToneTab, type ToneTake } from "./ToneTab.tsx";
+import { RhythmPage } from "./RhythmPage.tsx";
 import { engine } from "../../audio/AudioEngine.ts";
 import { useStore } from "../store.ts";
 import { useModel } from "../useModel.ts";
@@ -361,6 +362,8 @@ export function MicPage() {
   const [deaf, setDeaf] = useState<string | null>(null);
   const deafRef = useRef<string | null>(null);
   const [tab, setTab] = useState<Tab>(() => loadTab());
+  // rhythm practice: its own page, off this one
+  const [rhythm, setRhythm] = useState(false);
   const tabRef = useRef(tab);
   tabRef.current = tab;
   // her long breaths, kept on the phone: each one that ends is added
@@ -777,10 +780,22 @@ export function MicPage() {
   const listening = tab === "mouth" ? (heard.kind === "vowel" ? `${nameNow(heard.f0)}${high ? "：音太高时口型测不准，仅供参考。" : ` · 实测共振峰 F1 ${Math.round(heard.F1)} · F2 ${Math.round(heard.F2)} Hz`}` : KIND_TEXT[heard.kind]) : heard.kind === "silence" ? "正在听… 唱一个音。" : heard.kind === "vowel" || heard.kind === "held" ? "正在听。" : "听到辅音或气声：没有音高。";
   const status = error ?? flash ?? (on && deaf ? (deaf === "running" ? "没有收到声音：麦克风可能被别的应用占用（电话、录音、其他网页）。关掉它们，再点“停止”后重新“开始听”。" : "音频被系统暂停了：点一下屏幕任意位置即可恢复。") : ref ? `校准 ${calStep! + 1} / ${REFS.length}：用舒服的中低音唱“${ref.char}——”（${ref.hint}），保持约 2 秒。${heard.f0 > 350 ? "音有点高，低一些更准。" : ""}` : calMsg && heard.kind === "silence" ? calMsg : !on ? "点“开始听”，对着手机唱。长元音（啊、一、乌…）最清楚。" : listening);
   const refLine = mark ? `参考：${mark.closed != null ? `闭合 ${Math.round(mark.closed)}%（${refNote(mark)}）` : `${refNote(mark)}（那次没读到闭合）`}${mark.sd != null ? ` · 起伏 ±${mark.sd.toFixed(1)} dB` : ""}${mark.onset ? ` · ${ONSET_WORD[mark.onset]}` : ""}` : null;
+  if (rhythm) return <RhythmPage onBack={() => setRhythm(false)} />;
   return (
     <div className="mic-page">
       <header className="mic-top">
         <span className="wordmark">Chimera</span>
+        <button
+          type="button"
+          className="chip mic-rhythm-entry"
+          onClick={() => {
+            // one microphone at a time: this page stops listening first
+            if (on) void toggle();
+            setRhythm(true);
+          }}
+        >
+          节奏
+        </button>
         <Segmented<BodyName>
           label="声音类型"
           value={presetOf(body)}

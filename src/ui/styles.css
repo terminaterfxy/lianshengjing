@@ -2794,6 +2794,87 @@ input[type="range"]::-moz-range-thumb {
   color: var(--amber);
 }
 
+/* rhythm practice */
+.rhythm-page {
+  grid-template-rows: auto 0 minmax(0, 1fr);
+}
+
+.rhythm-title {
+  margin: 0;
+  font-family: system-ui, -apple-system, "PingFang SC", sans-serif;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--text);
+}
+
+.rhythm-back {
+  font-size: 15px;
+  text-decoration: none;
+}
+
+.rhythm-bpm {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.rhythm-bpm .chip {
+  min-width: 40px;
+  font-size: 18px;
+  /* the display font draws "+" faint beside "−": it read as disabled */
+  font-family: system-ui, sans-serif;
+  font-weight: 300;
+}
+
+.rhythm-cal {
+  margin-left: 12px;
+}
+
+.rhythm-stage {
+  justify-items: center;
+  text-align: center;
+}
+
+.rhythm-beat {
+  font-size: 72px;
+  font-weight: 600;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  animation: rhythm-flash 0.25s ease-out;
+}
+
+.rhythm-beat.accent {
+  color: var(--amber);
+}
+
+.rhythm-beat.count {
+  opacity: 0.6;
+}
+
+@keyframes rhythm-flash {
+  from {
+    transform: scale(1.25);
+    text-shadow: 0 0 18px currentColor;
+  }
+  to {
+    transform: scale(1);
+    text-shadow: none;
+  }
+}
+
+.rhythm-offsets .screen-body {
+  height: 220px;
+  min-height: 220px;
+}
+
+.mic-rhythm-entry {
+  flex: none;
+  font-family: system-ui, -apple-system, "PingFang SC", sans-serif;
+  letter-spacing: 0;
+}
+
 .mic-breath-history .screen-body {
   height: 190px;
   min-height: 190px;

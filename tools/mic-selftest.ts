@@ -25,6 +25,7 @@ import { RangeRecorder } from "../src/mic/range.ts";
 import { noteOf, PitchTracker } from "../src/mic/pitch.ts";
 import { addRecord, byDay, parseRecords, recordOf, type BreathRecord } from "../src/mic/history.ts";
 import { bandPowers, brightnessOf, N_BANDS } from "../src/mic/tone.ts";
+import { findClicks, findOnsets, score } from "../src/mic/rhythm.ts";
 import { initChimera, call } from "../src/wasm/chimera.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -572,6 +573,66 @@ try {
     const clip = all.subarray(r0.offset, r0.offset + r0.len);
     const loud = read(clip, 48000), soft = read(clip, 48000, 0.25);
     check("brightness, sung 12 dB softer", loud.b !== null && soft.b !== null && Math.abs(soft.b - loud.b) < 0.3 && Math.abs(loud.lv! - soft.lv! - 12) < 0.5, `${loud.b?.toFixed(2)} and ${soft.b?.toFixed(2)} dB; level ${(loud.lv! - soft.lv!).toFixed(1)} dB lower`);
+  }
+
+  // ---- rhythm: syllable starts against the beats, and the phone's own delay
+  console.log("\nrhythm");
+  {
+    // a take as the phone would record it: the clicks it plays coming back 83 ms late, and "da"s
+    // sung up to 80 ms off the beat (two beats left out), vowel attacks of 10–40 ms, a quiet room
+    const take = (sr: number) => {
+      const D = 0.083, gap = 60 / 90, t0 = 0.5, count = 4, n = 16;
+      const beats = Array.from({ length: count + n }, (_, k) => t0 + k * gap);
+      const x = new Float32Array(Math.round((t0 + (count + n + 1) * gap) * sr));
+      const click = (y: Float32Array, t: number, f: number) => {
+        const s = Math.round(t * sr);
+        for (let i = 0; i < 0.06 * sr && s + i < y.length; i++) y[s + i] += 0.25 * Math.min(1, i / sr / 0.001) * Math.exp(-i / sr / 0.015) * Math.sin((2 * Math.PI * f * i) / sr);
+      };
+      beats.forEach((b, k) => click(x, b + D, k % 4 ? 2500 : 3500));
+      const truth: (number | null)[] = [];
+      for (let i = 0; i < n; i++) {
+        if (i === 5 || i === 11) {
+          truth.push(null);
+          continue;
+        }
+        const off = (rnd() - 0.5) * 0.16, attack = 0.01 + 0.03 * rnd(), f0 = 220 + 20 * (i % 3), s = Math.round((beats[count + i] + D + off) * sr);
+        truth.push(off * 1000);
+        for (let k = -Math.round(0.012 * sr); k < 0; k++) x[s + k] += 0.04 * gauss();
+        for (let k = 0; k < 0.28 * sr && s + k < x.length; k++) {
+          const tt = k / sr, env = Math.min(1, tt / attack, (0.28 - tt) / 0.04);
+          let v = 0;
+          for (let h = 1; h * f0 < 4000; h++) v += (1 / (1 + ((h * f0 - 700) / 150) ** 2) + 0.5 / (1 + ((h * f0 - 1200) / 200) ** 2) + 0.05) * Math.sin(2 * Math.PI * h * f0 * tt);
+          x[s + k] += 0.15 * env * v;
+        }
+      }
+      for (let i = 0; i < x.length; i++) x[i] += 0.002 * gauss();
+      // and the delay measured as the page does: clicks alone, the phone hearing itself
+      const c = new Float32Array(Math.round(4.6 * sr)), at: number[] = [];
+      for (let k = 0; k < 8; k++) {
+        at.push(Math.round((0.4 + 0.5 * k) * sr));
+        click(c, 0.4 + 0.5 * k + D, 3000);
+      }
+      for (let i = 0; i < c.length; i++) c[i] += 0.002 * gauss();
+      return { x, beats: beats.slice(count), truth, cal: findClicks(c, sr, at), D };
+    };
+    for (const sr of [48000, 16000]) {
+      const { x, beats, truth, cal, D } = take(sr);
+      const sc = score(findOnsets(x, sr), beats, cal?.delay ?? D);
+      const errs = sc.offsets.flatMap((o, i) => (o === null || truth[i] === null ? [] : [o - truth[i]!]));
+      const worst = Math.max(...errs.map(Math.abs));
+      check(`rhythm, a sung take at ${sr / 1000} kHz`, !!cal && Math.abs(cal.delay - D) < 0.0015 && sc.hit === 14 && sc.extra === 0 && sc.offsets[5] === null && sc.offsets[11] === null && worst < 10, `delay measured ${cal ? (cal.delay * 1000).toFixed(1) : "—"} ms (83); ${sc.hit} of 14 syllables found, ${sc.extra} extra; worst error ${worst.toFixed(1)} ms`);
+    }
+    // the engine singing "da" and "ta" on every beat at 90 a minute: one start each, 667 ms apart
+    for (const [lyr, name] of [["哒", "da"], ["他", "ta"]]) {
+      writeFileSync(join(tmp, "beat.json"), JSON.stringify({ bpm: 90, vibrato: 0, lyrics: Array(8).fill(lyr).join(" "), notes: Array(8).fill([64, 1]) }));
+      render("notes", join(tmp, "beat.json"), join(tmp, "beat"), "female");
+      const { x, sr } = wav(join(tmp, "beat.wav"));
+      const on = findOnsets(x, sr), iv = on.slice(1).map((t, i) => (t - on[i]) * 1000);
+      check(`rhythm, the engine's "${name}" on every beat`, on.length === 8 && iv.every((v) => Math.abs(v - 666.7) < 5), `${on.length} starts, ${iv.map((v) => v.toFixed(0)).join(" ")} ms apart (8, 667)`);
+    }
+    // the score: early, late, a miss, a stray syllable, two on one beat
+    const sc = score([0.47, 1.05, 2.5, 3.02, 3.08].map((t) => t + 0.05), [0.5, 1, 1.5, 2, 3], 0.05);
+    check("rhythm, the score", sc.offsets.map((o) => (o === null ? "-" : Math.round(o))).join() === "-30,50,-,-,20" && sc.hit === 3 && sc.extra === 2 && Math.round(sc.mean!) === 13, `offsets ${sc.offsets.map((o) => (o === null ? "-" : Math.round(o))).join(" ")} ms, ${sc.hit} hit, ${sc.extra} extra, mean ${sc.mean?.toFixed(0)} ms`);
   }
 } finally {
   rmSync(tmp, { recursive: true, force: true });
