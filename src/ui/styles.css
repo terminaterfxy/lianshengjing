@@ -2783,6 +2783,21 @@ input[type="range"]::-moz-range-thumb {
   min-height: 220px;
 }
 
+.mic-breath-history .screen-body {
+  height: 190px;
+  min-height: 190px;
+}
+
+.mic-history-count {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+/* a time and its reading, laid on the list's own two columns */
+.mic-history-row {
+  display: contents;
+}
+
 .mic-pitch-note {
   font-size: 34px;
   font-weight: 600;

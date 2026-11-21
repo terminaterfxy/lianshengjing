@@ -46,6 +46,15 @@ export class MicSession {
   onset: Onset | null = null;
   /** a range being recorded, or null */
   ranging: RangeRecorder | null = null;
+  /** how many breaths have ended, and the last one that did (for the history) */
+  breathsEnded = 0;
+  endedBreath: Steadiness | null = null;
+  private breathWas = false;
+
+  /** a breath is in progress (its reading is `steady`) */
+  get breathSounding(): boolean {
+    return this.breath.sounding;
+  }
 
   /** the level of the note in progress (or the last) over time, for drawing */
   get breathTrace(): { t: readonly number[]; db: readonly number[] } {
@@ -86,6 +95,11 @@ export class MicSession {
     // note's beginning: wait for the one that lasts
     else if (!voiced && this.beganAt) this.beganAt = 0;
     this.steady = this.breath.last;
+    if (this.breathWas && !this.breath.sounding) {
+      this.endedBreath = this.breath.last;
+      this.breathsEnded++;
+    }
+    this.breathWas = this.breath.sounding;
     if (this.beganAt && now - this.beganAt >= 230) {
       const rec = now - this.beganAt < 580 && h.f0 > 0 ? recent() : null;
       this.beganAt = 0;

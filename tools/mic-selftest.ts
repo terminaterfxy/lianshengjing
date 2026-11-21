@@ -23,6 +23,7 @@ import { analyseOnset } from "../src/mic/breath.ts";
 import { MicSession, readFrame, replay } from "../src/mic/session.ts";
 import { RangeRecorder } from "../src/mic/range.ts";
 import { noteOf, PitchTracker } from "../src/mic/pitch.ts";
+import { addRecord, byDay, parseRecords, recordOf, type BreathRecord } from "../src/mic/history.ts";
 import { initChimera, call } from "../src/wasm/chimera.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -318,10 +319,47 @@ try {
         was = on;
         kinds.add(s.heard.kind);
       });
-      // 15 beats and 14 beats at 72 a minute: 12.5 s and 11.7 s, less the engine's own release
+      // each line is 15 beats at 72 a minute, 12.5 s (the bounds are loose: this one reads 0.35 s early)
       const ok = breaths.length === 2 && Math.abs(breaths[0] - 12.2) < 1.2 && Math.abs(breaths[1] - 11.5) < 1.2;
       check(`a song with words, two lines, ${fps} frames a second`, ok, `${breaths.length} breaths read: ${breaths.map((b) => b.toFixed(1) + " s").join(", ")} (two, of about 12 s each); sounds heard: ${[...kinds].join(" ")}`);
     }
+    // the history keeps each breath once, when it ends (a second of quiet after it), and not a
+    // breath too short to say anything: the song's two lines, then a one-second "ah"
+    const one = new Float32Array(sr);
+    for (let i = 0; i < one.length; i++) {
+      const t = i / sr, env = Math.min(1, t / 0.05, (1 - t) / 0.05);
+      let v = 0;
+      for (let k = 1; k <= 10; k++) v += Math.sin(2 * Math.PI * 220 * k * t) / k;
+      one[i] = 0.05 * env * v;
+    }
+    const xx = new Float32Array(x.length + one.length + 2 * sr);
+    xx.set(x);
+    xx.set(one, x.length + Math.round(0.5 * sr));
+    for (const fps of [60, 20]) {
+      const s = new MicSession();
+      let seen = 0;
+      const kept: number[] = [];
+      replay(s, xx, sr, fps, () => {
+        if (s.breathsEnded === seen) return;
+        seen = s.breathsEnded;
+        const r = recordOf(s.endedBreath, 0);
+        if (r) kept.push(r.seconds);
+      });
+      const ok = s.breathsEnded === 3 && kept.length === 2 && kept.every((k) => Math.abs(k - 12.5) < 0.6);
+      check(`the breath history, ${fps} frames a second`, ok, `${s.breathsEnded} breaths ended, ${kept.length} kept: ${kept.map((b) => b.toFixed(1) + " s").join(", ")} (3 ended; the two lines of 12.5 s kept, the 1 s note not)`);
+    }
+  }
+  {
+    // by day, on the phone's own calendar; a stored list with junk in it keeps what is good
+    const day = (d: number, h: number) => new Date(2026, 10, d, h, 0).getTime();
+    let list: BreathRecord[] = [];
+    for (const [d, h, secs, sd] of [[20, 9, 6.1, 1.4], [20, 21, 8.3, 2.2], [21, 10, 7.0, 0.9], [22, 8, 9.4, 1.1], [22, 8.5, 5.2, 0.6], [22, 9, 7.7, 1.8]]) {
+      list = addRecord(list, recordOf({ seconds: secs, sd, slope: -0.2 }, day(d, h))!);
+    }
+    const junk = JSON.stringify([...list, { at: "x" }, null, { at: 1, seconds: NaN, sd: 1, slope: 0 }]);
+    const days = byDay(parseRecords(junk));
+    const ok = days.length === 3 && days.map((d) => d.longest.seconds).join() === "8.3,7,9.4" && days[2].steadiest.sd === 0.6 && days[2].count === 3 && days[0].sd === 1.8 && days[2].sd === 1.1 && recordOf({ seconds: 1.9, sd: 0.5, slope: 0 }, 0) === null && parseRecords("{bad") .length === 0;
+    check("the breath history by day", ok, days.map((d) => `${d.month}/${d.day}: ${d.count}, longest ${d.longest.seconds} s, steadiest ±${d.steadiest.sd}, typical ±${d.sd}`).join("; "));
   }
   // noise and a cough are not notes
   const rr = new RangeRecorder();

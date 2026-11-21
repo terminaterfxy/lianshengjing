@@ -28,6 +28,8 @@ import { midiOf, MIN_FPS, noteOf, type NoteReading, type Vibrato } from "../../m
 import { applyAffine, CalibrationRun, calibrationProblem, fitAffine, loadCalibration, REFS, saveCalibration, type Affine, type Calibration } from "../../mic/calibrate.ts";
 import type { VoiceModel } from "../analysis.ts";
 import type { Onset, OnsetKind, Steadiness } from "../../mic/breath.ts";
+import { addRecord, parseRecords, recordOf, type BreathRecord } from "../../mic/history.ts";
+import { BreathHistory, sdWord } from "./BreathHistory.tsx";
 import { engine } from "../../audio/AudioEngine.ts";
 import { useStore } from "../store.ts";
 import { useModel } from "../useModel.ts";
@@ -195,7 +197,6 @@ interface ClosureRef {
 const refNote = (r: ClosureRef) => (r.midi != null ? noteOf(r.midi) : noteName(r.f0));
 const ONSET_WORD: Record<OnsetKind, string> = { soft: "软起音", hard: "硬起音", breathy: "气起音" };
 const ONSET_HINT: Record<OnsetKind, string> = { soft: "气和声同时到", hard: "声带先闭紧再撞开", breathy: "先漏气再出声" };
-const sdWord = (sd: number) => (sd <= 1 ? "很稳" : sd <= 2 ? "较稳" : "起伏大");
 /** off from the nearest semitone, in words; the bands (±10, ±25 cents) are rules of thumb */
 const centsText = (c: number) => {
   const r = Math.round(c), a = Math.abs(r);
@@ -221,6 +222,16 @@ const RANGE: Record<"male" | "female" | "child", [number, number]> = { male: [82
 function stretchOf(f0: number, body: BodyMix, own: [number, number] | null = null): number {
   const [lo, hi] = own ?? RANGE[body.child > 0.5 ? "child" : body.female > 0.5 ? "female" : "male"];
   return clamp(Math.log2(f0 / lo) / Math.log2(hi / lo), 0, 1);
+}
+
+/** her long breaths over the days (src/mic/history.ts) */
+const HISTORY_KEY = "chimera.mic.breaths";
+function loadHistory(): BreathRecord[] {
+  try {
+    return parseRecords(localStorage.getItem(HISTORY_KEY));
+  } catch {
+    return [];
+  }
 }
 
 /** the singer's own lowest and highest notes (Hz), once she has sung them */
@@ -339,6 +350,36 @@ export function MicPage() {
   const [deaf, setDeaf] = useState<string | null>(null);
   const deafRef = useRef<string | null>(null);
   const [tab, setTab] = useState<Tab>(() => loadTab());
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+  // her long breaths, kept on the phone: each one that ends is added
+  const [history, setHistory] = useState<BreathRecord[]>(() => loadHistory());
+  const historyRef = useRef(history);
+  const keepBreath = (s: Steadiness | null) => {
+    const r = recordOf(s, Date.now());
+    if (!r) return;
+    const list = historyRef.current;
+    const best = list.length > 0 && r.seconds > Math.max(...list.map((x) => x.seconds));
+    const next = addRecord(list, r);
+    historyRef.current = next;
+    setHistory(next);
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+    } catch {
+      // private browsing: kept until the page closes
+    }
+    if (tabRef.current === "breath") say(`${best ? "新纪录！" : ""}这口气 ${r.seconds.toFixed(1)} 秒，已记进历史。`);
+  };
+  const clearHistory = () => {
+    historyRef.current = [];
+    setHistory([]);
+    try {
+      localStorage.removeItem(HISTORY_KEY);
+    } catch {
+      // nothing to remove
+    }
+    say("历史记录已清除。");
+  };
   const pickTab = (t: Tab) => {
     setTab(t);
     try {
@@ -385,6 +426,7 @@ export function MicPage() {
     let tipFree = true;
     let frames = 0, framesSince = performance.now();
     let noteAwaySince: number | null = null;
+    let seenBreaths = 0;
     let lastAudio = performance.now();
     let affine: Affine | null = null, affineOf: Calibration | null | undefined = undefined, affineModel: VoiceModel | null = null;
     const loop = (now: number) => {
@@ -453,6 +495,10 @@ export function MicPage() {
       levelRef.current = session.level;
       steadyRef.current = session.steady;
       onsetRef.current = session.onset;
+      if (session.breathsEnded !== seenBreaths) {
+        seenBreaths = session.breathsEnded;
+        keepBreath(session.endedBreath);
+      }
       // the pitch needle glides too (a new note jumps there)
       const pc = session.pitch.centre, ps = shownCentre.current;
       // the take's note: the pitch tab's centre (one frame's pitch swings with the vibrato)
@@ -550,6 +596,9 @@ export function MicPage() {
     if (on) {
       run.current = null;
       setCalStep(null);
+      // a breath still going when she stops counts as ended here
+      const s = sessionRef.current;
+      if (s?.breathSounding) keepBreath(s.steady);
       listener.stop();
       st.setHold(false);
       setOn(false);
@@ -946,6 +995,7 @@ export function MicPage() {
                 </dd>
               </dl>
             </section>
+            <BreathHistory list={history} onClear={clearHistory} />
             <details className="mic-help">
               <summary>怎么看</summary>
               <ul>
@@ -960,6 +1010,9 @@ export function MicPage() {
                 </li>
                 <li>
                   <b>起音</b>：软起音是气和声同时到；硬起音是声带先闭紧再撞开；气起音是先漏一段气才出声。要从安静开始唱才能判断。
+                </li>
+                <li>
+                  <b>历史记录</b>：从出声到安静满 1 秒算一口气，中间换字、短暂停顿不算断。唱满 2 秒以上的一口气自动记下它的时长、音量起伏和走势；正唱着时点“停止”也会记下。柱子是每天最长的一口气，柱子下面的数字是当天各口气音量起伏的中间值。练长音时用同一个音、差不多的音量，前后才好比。记录只存在这台手机的这个网页里，清除浏览器数据会一起清掉。
                 </li>
               </ul>
             </details>
