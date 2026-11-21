@@ -2,7 +2,7 @@
  * Everything the mic page reads off a voice, frame by frame, in one place and with no browser in
  * it: what kind of sound it is and its vowel (SoundTracker), how the folds close (glottis.ts), the
  * breath under the note and how the note began (breath.ts), the note's pitch and vibrato
- * (pitch.ts), and a range being recorded (range.ts).
+ * (pitch.ts), how bright it is (tone.ts), and a range being recorded (range.ts).
  * The page feeds it the microphone; `tools/mic-selftest.ts` feeds it rendered audio at a fixed
  * frame rate, so what is tested is what runs.
  */
@@ -12,22 +12,27 @@ import { SoundTracker, QUIET, type Heard } from "./track.ts";
 import { analyseOnset, BreathTracker, type Onset, type Steadiness } from "./breath.ts";
 import { RangeRecorder } from "./range.ts";
 import { PitchTracker } from "./pitch.ts";
+import { bandPowers, ToneTracker } from "./tone.ts";
 
 export interface Frame {
   fr: MicFrame;
   glottal: GlottalFeatures | null;
+  /** the frame's power in 100 Hz bands, for the brightness (null when it is not voiced) */
+  bands: Float32Array | null;
 }
 
 /** One analysis frame from the newest ~43 ms of sound, `frameLength` samples (what MicListener.read gives). */
 export function readFrame(samples: Float32Array, sampleRate: number): Frame {
   const fr = analyse(samples, sampleRate);
-  return { fr, glottal: fr.voiced && fr.formants.length >= 2 ? glottalFeatures(samples, sampleRate, fr.f0, fr.formants) : null };
+  return { fr, glottal: fr.voiced && fr.formants.length >= 2 ? glottalFeatures(samples, sampleRate, fr.f0, fr.formants) : null, bands: fr.voiced ? bandPowers(samples, sampleRate) : null };
 }
 
 export class MicSession {
   readonly tracker = new SoundTracker();
   /** the note sung, its vibrato and how steady it is */
   readonly pitch = new PitchTracker();
+  /** how bright the held sound is */
+  readonly tone = new ToneTracker();
   private readonly breath = new BreathTracker();
   private oqs: { t: number; v: number; db: number }[] = [];
   private beganAt = 0;
@@ -109,6 +114,7 @@ export class MicSession {
 
     this.ranging?.feed(now, voiced && fr.voiced && fr.clarity >= 0.8 ? fr.f0 : 0);
     this.pitch.feed(now, voiced && fr.voiced ? fr.f0 : 0);
+    this.tone.feed(now, voiced && fr.voiced ? f.bands : null);
     return h;
   }
 }

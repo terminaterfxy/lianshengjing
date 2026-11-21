@@ -2,7 +2,7 @@
  * Self-test of the mic page's readings (src/mic): the engine renders sounds whose answers are
  * known, and they are played to the same MicSession the page runs, frame by frame.
  *
- *   cargo build --release -p chimera-cli && cargo build --release -p chimera --example glottis_sweep
+ *   cargo build --release -p chimera-cli && cargo build --release -p chimera --example glottis_sweep --example brightness_sweep
  *   node tools/mic-selftest.ts
  *
  * What it checks: vowel formants, calibration to another voice, which sounds are recognised, the
@@ -24,10 +24,11 @@ import { MicSession, readFrame, replay } from "../src/mic/session.ts";
 import { RangeRecorder } from "../src/mic/range.ts";
 import { noteOf, PitchTracker } from "../src/mic/pitch.ts";
 import { addRecord, byDay, parseRecords, recordOf, type BreathRecord } from "../src/mic/history.ts";
+import { bandPowers, brightnessOf, N_BANDS } from "../src/mic/tone.ts";
 import { initChimera, call } from "../src/wasm/chimera.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const cli = join(root, "target/release/chimera"), sweep = join(root, "target/release/examples/glottis_sweep");
+const cli = join(root, "target/release/chimera"), sweep = join(root, "target/release/examples/glottis_sweep"), brightSweep = join(root, "target/release/examples/brightness_sweep");
 const tmp = mkdtempSync(join(tmpdir(), "chimera-mic-"));
 let failed = 0;
 const check = (name: string, ok: boolean, detail: string) => {
@@ -528,6 +529,49 @@ try {
     for (let i = 0; i < 240; i++) p.feed(i * 16.7, i % 37 === 0 || i % 50 === 0 || i % 50 === 1 ? 440 : 220);
     const r = p.note;
     check("octave slips of one and two frames", !!r && noteOf(r.midi) === "A3" && Math.abs(r.cents) < 1, r ? `${noteOf(r.midi)} ${r.cents.toFixed(2)} cents` : "none");
+  }
+
+  // ---- brightness: the engine's epilarynx narrowed (the singer's formant) on held, vibrato notes
+  console.log("\nbrightness");
+  {
+    const dir = join(tmp, "bright");
+    execFileSync(brightSweep, [dir, "female", "mini"], { stdio: "ignore" });
+    const recs = JSON.parse(readFileSync(join(dir, "sweep.json"), "utf8")) as { vowel: string; epi: number; offset: number; len: number }[];
+    const buf = readFileSync(join(dir, "sweep.f32"));
+    const all = new Float32Array(buf.buffer, buf.byteOffset, buf.length / 4);
+    // the page's reading at the end of a note, at 48 or 16 kHz (and its level)
+    const read = (clip: Float32Array, sr: number, gain = 1) => {
+      const x = new Float32Array(clip.length + Math.round(0.2 * sr));
+      for (let i = 0; i < clip.length; i++) x[Math.round(0.1 * sr) + i] = gain * clip[i];
+      const s = new MicSession();
+      const got: { b: number | null; lv: number | null } = { b: null, lv: null };
+      replay(s, x, sr, 60, () => {
+        if (s.tone.brightness !== null) [got.b, got.lv] = [s.tone.brightness, s.tone.level];
+      });
+      return got;
+    };
+    // the clean figure: the last second, long frames
+    const clean = (clip: Float32Array) => {
+      const acc = new Float64Array(N_BANDS);
+      for (let e = clip.length; e > clip.length - 48000; e -= 800) {
+        const bp = bandPowers(clip.subarray(e - 2048, e), 48000);
+        for (let i = 0; i < N_BANDS; i++) acc[i] += bp[i];
+      }
+      return brightnessOf(acc)!;
+    };
+    for (const vowel of ["ɑ", "i"]) {
+      const rs = recs.filter((r) => r.vowel === vowel).sort((a, b) => a.epi - b.epi);
+      const clips = rs.map((r) => all.subarray(r.offset, r.offset + r.len));
+      const c = clips.map(clean), at48 = clips.map((x) => read(x, 48000).b ?? NaN), at16 = clips.map((x) => read(decimate(x, 3), 16000).b ?? NaN);
+      const rises = (v: number[]) => v.every((q, i) => i === 0 || q > v[i - 1]);
+      const ok = rises(at48) && rises(at16) && at48[2] - at48[0] >= 3 && at48.every((q, i) => Math.abs(q - c[i]) < 0.5) && at16.every((q, i) => Math.abs(q - at48[i]) < 1);
+      check(`brightness, /${vowel}/, epilarynx open → narrow`, ok, `48 kHz ${at48.map((q) => q.toFixed(1)).join(" → ")} dB (clean ${c.map((q) => q.toFixed(1)).join(" → ")}); 16 kHz ${at16.map((q) => q.toFixed(1)).join(" → ")}`);
+    }
+    // sung 12 dB softer into the same microphone: the same brightness, a level 12 dB down
+    const r0 = recs.find((r) => r.vowel === "ɑ" && r.epi === 0)!;
+    const clip = all.subarray(r0.offset, r0.offset + r0.len);
+    const loud = read(clip, 48000), soft = read(clip, 48000, 0.25);
+    check("brightness, sung 12 dB softer", loud.b !== null && soft.b !== null && Math.abs(soft.b - loud.b) < 0.3 && Math.abs(loud.lv! - soft.lv! - 12) < 0.5, `${loud.b?.toFixed(2)} and ${soft.b?.toFixed(2)} dB; level ${(loud.lv! - soft.lv!).toFixed(1)} dB lower`);
   }
 } finally {
   rmSync(tmp, { recursive: true, force: true });

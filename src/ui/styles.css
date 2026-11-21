@@ -2783,6 +2783,17 @@ input[type="range"]::-moz-range-thumb {
   min-height: 220px;
 }
 
+.mic-tone-spectrum .screen-body {
+  height: 180px;
+  min-height: 180px;
+}
+
+/* why a comparison with the reference is not fair */
+.mic-card p.mic-caveat {
+  font-size: 13px;
+  color: var(--amber);
+}
+
 .mic-breath-history .screen-body {
   height: 190px;
   min-height: 190px;

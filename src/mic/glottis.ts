@@ -32,7 +32,7 @@ const N = 4096;
 const re = new Float64Array(N), im = new Float64Array(N), db = new Float64Array(N / 2);
 const win: Float64Array[] = [];
 
-function fft(re: Float64Array, im: Float64Array): void {
+export function fft(re: Float64Array, im: Float64Array): void {
   const n = re.length;
   for (let i = 1, j = 0; i < n; i++) {
     let bit = n >> 1;

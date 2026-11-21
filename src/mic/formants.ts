@@ -5,6 +5,7 @@
  */
 
 import { glottalFeatures, type GlottalFeatures } from "./glottis.ts";
+import { bandPowers } from "./tone.ts";
 
 export interface MicFrame {
   /** RMS level of the whole band, dBFS */
@@ -215,6 +216,8 @@ export class MicListener {
   private longBuf = new Float32Array(32768);
   /** the last frame's glottal features (null when it had no readable vowel) */
   glottal: GlottalFeatures | null = null;
+  /** the last frame's power in 100 Hz bands (null when it was not voiced) */
+  bands: Float32Array | null = null;
 
   get running(): boolean {
     return !!this.node;
@@ -299,6 +302,7 @@ export class MicListener {
     const fr = analyse(x, sr);
     // how the folds close, for a voice with a readable vowel
     this.glottal = fr.voiced && fr.formants.length >= 2 ? glottalFeatures(x, sr, fr.f0, fr.formants) : null;
+    this.bands = fr.voiced ? bandPowers(x, sr) : null;
     return fr;
   }
 

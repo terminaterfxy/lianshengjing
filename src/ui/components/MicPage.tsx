@@ -1,6 +1,6 @@
 /**
- * The mic page (the default route): a real voice's pitch, breath, folds and mouth, one tab each.
- * The pitch, breath and fold readings are src/mic/session.ts's; this file draws them. Below, how
+ * The mic page (the default route): a real voice's pitch, breath, folds, tone and mouth, one tab
+ * each. The readings are src/mic/session.ts's; this file draws them. Below, how
  * the mouth tab's head is driven.
  *
  * The microphone gives three things (src/mic/formants.ts): the pitch, how clear or breathy the
@@ -30,6 +30,7 @@ import type { VoiceModel } from "../analysis.ts";
 import type { Onset, OnsetKind, Steadiness } from "../../mic/breath.ts";
 import { addRecord, parseRecords, recordOf, type BreathRecord } from "../../mic/history.ts";
 import { BreathHistory, sdWord } from "./BreathHistory.tsx";
+import { ToneTab, type ToneTake } from "./ToneTab.tsx";
 import { engine } from "../../audio/AudioEngine.ts";
 import { useStore } from "../store.ts";
 import { useModel } from "../useModel.ts";
@@ -42,12 +43,12 @@ import { TEXT } from "../colors.ts";
 import { beamPts, dot, label, labelBlock, seg, type Pt } from "../render/vector.ts";
 
 /** what the page shows: one thing at a time */
-type Tab = "pitch" | "breath" | "folds" | "mouth";
+type Tab = "pitch" | "breath" | "folds" | "tone" | "mouth";
 const TAB_KEY = "chimera.mic.tab";
 const loadTab = (): Tab => {
   try {
     const t = localStorage.getItem(TAB_KEY);
-    return t === "mouth" || t === "folds" || t === "breath" ? t : "pitch";
+    return t === "mouth" || t === "folds" || t === "breath" || t === "tone" ? t : "pitch";
   } catch {
     return "pitch";
   }
@@ -192,6 +193,12 @@ interface ClosureRef {
   midi?: number;
   wobble?: number;
   vib?: Vibrato | null;
+  /** the tone tab's brightness (dB), the vowel it was read on, and how loud that sound was (dB) */
+  bright?: number;
+  brightVowel?: string;
+  brightLevel?: number;
+  /** the vowel's first two formants then (Hz): two takes are the same vowel when these are close */
+  brightFormants?: { F1: number; F2: number };
 }
 /** the reference's note as the pitch tab named it (its centre), else from the closure take's pitch */
 const refNote = (r: ClosureRef) => (r.midi != null ? noteOf(r.midi) : noteName(r.f0));
@@ -208,7 +215,7 @@ const REF_KEY = "chimera.mic.closureRef";
 function loadClosureRef(): ClosureRef | null {
   try {
     const r = JSON.parse(localStorage.getItem(REF_KEY) ?? "null") as ClosureRef | null;
-    return r && r.f0 > 0 && ((r.closed ?? 0) > 0 || (r.midi ?? 0) > 0) ? r : null;
+    return r && r.f0 > 0 && ((r.closed ?? 0) > 0 || (r.midi ?? 0) > 0 || typeof r.bright === "number") ? r : null;
   } catch {
     return null;
   }
@@ -306,6 +313,10 @@ export function MicPage() {
   const centsMark = useRef<HTMLElement | null>(null);
   const [pitchNote, setPitchNote] = useState<NoteReading | null>(null);
   const [pitchLive, setPitchLive] = useState(false);
+  // the held sound's brightness now, or the last one read (kept after the sound stops)
+  const [tone, setTone] = useState<ToneTake | null>(null);
+  const [toneLive, setToneLive] = useState(false);
+  const lastTone = useRef<ToneTake | null>(null);
   const lastPitchAt = useRef(-1e9);
   // a word of confirmation (remembered), for a moment
   const [flash, setFlash] = useState<string | null>(null);
@@ -427,6 +438,8 @@ export function MicPage() {
     let frames = 0, framesSince = performance.now();
     let noteAwaySince: number | null = null;
     let seenBreaths = 0;
+    // the vowels heard over the last second, for naming the held sound's vowel
+    const vowels: { t: number; v: string; F1: number; F2: number }[] = [];
     let lastAudio = performance.now();
     let affine: Affine | null = null, affineOf: Calibration | null | undefined = undefined, affineModel: VoiceModel | null = null;
     const loop = (now: number) => {
@@ -442,7 +455,7 @@ export function MicPage() {
       deafRef.current = now - lastAudio > 2000 ? listener.state : null;
       const st = useStore.getState();
       session.voice = st.body.female < 0.5 && st.body.child < 0.5 ? "male" : "female";
-      const h = session.step(now, dt, { fr, glottal: listener.glottal }, () => listener.recent());
+      const h = session.step(now, dt, { fr, glottal: listener.glottal, bands: listener.bands }, () => listener.recent());
       heardRef.current = h;
       const kind = h.kind;
       // a calibration in progress: each reference vowel, held for a while, after a pause
@@ -472,6 +485,7 @@ export function MicPage() {
       if (kind === "vowel") {
         const p = affine ? applyAffine(affine, h) : h;
         target = { ...rest(), ...m.articForFormants(p.F1, p.F2) };
+        vowels.push({ t: now, v: nearestVowel(m, p.F1, p.F2), F1: p.F1, F2: p.F2 });
         tipFree = true;
       } else if (kind === "s" || kind === "sh") {
         target = { ...rest(), ...poses[kind] };
@@ -520,6 +534,18 @@ export function MicPage() {
         if (sc !== null) centsMark.current.style.left = `${clamp(50 + (sc - shownNoteRef.current!) * 100, 0, 100)}%`;
       }
       if (session.pitch.note && sc !== null) lastPitchAt.current = now;
+      // the tone: the held sound's brightness, the vowel heard most over its second, its note and level
+      while (vowels.length && vowels[0].t < now - 1000) vowels.shift();
+      const bright = session.tone.brightness;
+      if (bright !== null) {
+        const count = new Map<string, number>();
+        for (const { v } of vowels) count.set(v, (count.get(v) ?? 0) + 1);
+        let vowel: string | null = null, most = 0;
+        for (const [v, c] of count) if (c > most) [vowel, most] = [v, c];
+        const mid = (a: number[]) => a.sort((x, y) => x - y)[a.length >> 1];
+        const formants = vowels.length >= 5 ? { F1: mid(vowels.map((q) => q.F1)), F2: mid(vowels.map((q) => q.F2)) } : null;
+        lastTone.current = { at: now, bright, vowel, formants, level: session.tone.level!, midi: pc ?? (h.f0 > 0 ? midiOf(h.f0) : null) };
+      }
 
       const sounding = kind !== "silence";
       const voicedNow = kind === "vowel" || kind === "held";
@@ -562,7 +588,9 @@ export function MicPage() {
         setDeaf(deafRef.current);
         setClosed(shownClosed.current);
         setLevel(levelRef.current);
-        setCanRemember((!!lastTake.current && now - lastTake.current.at < 4000) || now - lastPitchAt.current < 4000);
+        setCanRemember((!!lastTake.current && now - lastTake.current.at < 4000) || now - lastPitchAt.current < 4000 || (!!lastTone.current && now - lastTone.current.at < 4000));
+        setTone(lastTone.current);
+        setToneLive(!!lastTone.current && now - lastTone.current.at < 400);
         setSteady(steadyRef.current);
         setOnset(onsetRef.current);
         setCentre(shownCentre.current);
@@ -610,6 +638,7 @@ export function MicPage() {
       setShownNote(null);
       setClosed(null);
       setPitchLive(false);
+      setToneLive(false);
       setCanRemember(false);
       if (centsMark.current) centsMark.current.style.opacity = "0";
       if (nowMark.current) nowMark.current.style.opacity = "0";
@@ -692,9 +721,11 @@ export function MicPage() {
     const now = performance.now();
     const t = lastTake.current && now - lastTake.current.at <= 4000 ? lastTake.current : null;
     const p = now - lastPitchAt.current <= 4000 ? sessionRef.current?.pitch.note ?? null : null;
-    if (!t && !p) return;
-    const f0 = t?.f0 ?? 440 * 2 ** ((p!.midi - 69) / 12);
-    const r: ClosureRef = { closed: t?.closed, f0, level: t?.level ?? undefined, sd: steadyRef.current?.sd ?? undefined, onset: onsetRef.current?.kind, midi: p?.midi, wobble: p?.wobble ?? undefined, vib: p && p.seconds >= 1.1 ? p.vibrato : undefined };
+    const tn = lastTone.current && now - lastTone.current.at <= 4000 ? lastTone.current : null;
+    const midi = p?.midi ?? tn?.midi ?? null;
+    if (!t && midi === null) return;
+    const f0 = t?.f0 ?? 440 * 2 ** ((midi! - 69) / 12);
+    const r: ClosureRef = { closed: t?.closed, f0, level: t?.level ?? undefined, sd: steadyRef.current?.sd ?? undefined, onset: onsetRef.current?.kind, midi: p?.midi, wobble: p?.wobble ?? undefined, vib: p && p.seconds >= 1.1 ? p.vibrato : undefined, bright: tn?.bright, brightVowel: tn?.vowel ?? undefined, brightLevel: tn?.level, brightFormants: tn?.formants ?? undefined };
     say(`已记为参考（${refNote(r)}${r.closed != null ? ` · 闭合 ${Math.round(r.closed)}%` : ""}）。各页读数下面的“参考”就是这一次。`);
     try {
       localStorage.setItem(REF_KEY, JSON.stringify(r));
@@ -770,6 +801,7 @@ export function MicPage() {
             { value: "pitch", label: "音准" },
             { value: "breath", label: "气息" },
             { value: "folds", label: "声带" },
+            { value: "tone", label: "音色" },
             { value: "mouth", label: "口型" },
           ]}
         />
@@ -849,6 +881,15 @@ export function MicPage() {
               </ul>
             </details>
           </>
+        )}
+        {tab === "tone" && (
+          <ToneTab
+            tone={tone}
+            live={toneLive}
+            on={on}
+            mark={mark?.bright != null ? { bright: mark.bright, vowel: mark.brightVowel ?? null, formants: mark.brightFormants ?? null, level: mark.brightLevel ?? null, midi: mark.midi ?? midiOf(mark.f0) } : null}
+            spectrum={() => sessionRef.current?.tone.spectrum ?? null}
+          />
         )}
         {tab === "mouth" && (
           <>
@@ -1036,7 +1077,7 @@ export function MicPage() {
           )}
         </div>
         <div className="mic-ref-actions">
-          <button type="button" className={`chip${mark ? " on" : ""}`} disabled={!canRemember} onClick={remember} title="把刚才这个音的音准、颤音、闭合、音量、气息和起音记下来，以后照着找">
+          <button type="button" className={`chip${mark ? " on" : ""}`} disabled={!canRemember} onClick={remember} title="把刚才这个音的音准、颤音、闭合、音量、气息、起音和明亮度记下来，以后照着找">
             记为参考
           </button>
           {mark && (
