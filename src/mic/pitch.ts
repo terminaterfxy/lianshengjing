@@ -64,8 +64,9 @@ const MOVES = 0.8;
 /** the note's own body: not its first 0.2 s (the attack, a scoop up to it) nor its last 0.15 s (the release) */
 const HEAD = 0.2, TAIL = 0.15;
 /**
- * The analysis window (2048 samples, 43–46 ms) averages the pitch over its length and so shrinks a
- * vibrato's swing, as a moving average this long would (measured on sines of known swing, 4.5–7.5 Hz)
+ * The analysis window (43–46 ms at any sample rate: formants.ts frameLength) averages the pitch over
+ * its length and so shrinks a vibrato's swing, as a moving average this long would (measured on
+ * sines of known swing, 4.5–7.5 Hz)
  */
 const WINDOW = 0.04;
 
@@ -251,6 +252,8 @@ export class PitchTracker {
   /** the voiced stretch in progress (median-of-3 filtered), and where its current note starts in it */
   private run: Pt[] = [];
   private noteFrom = 0;
+  /** when the note in progress began (s): a long one keeps only its last 12 s of points */
+  private noteT0 = 0;
   /** since when the centre has been away from the note (s), or 0 */
   private awaySince = 0;
   /** the last three readings: one is kept once the next is in (see feed) */
@@ -281,6 +284,7 @@ export class PitchTracker {
       this.closeNote();
       this.run = [];
       this.noteFrom = 0;
+      this.noteT0 = t;
       this.awaySince = 0;
       this.raw = [{ t, m: midiOf(f0) }];
     } else if (!(f0 > 0) && t - this.lastPitch > GAP && this.run.length) {
@@ -305,7 +309,7 @@ export class PitchTracker {
     // (the next note has begun, and the split has not caught up yet) leaves the last good one
     if (this.run.length && t - this.readAt >= 0.1) {
       this.readAt = t;
-      this.current = readNote(this.run.slice(this.noteFrom)) ?? this.current;
+      this.current = this.timed(readNote(this.run.slice(this.noteFrom))) ?? this.current;
     }
   }
 
@@ -344,6 +348,7 @@ export class PitchTracker {
         const from = this.run.findIndex((q, i) => i >= this.noteFrom && q.t >= this.awaySince - 0.15);
         this.closeNote(from);
         this.noteFrom = from;
+        this.noteT0 = this.run[from].t;
         this.awaySince = 0;
       }
     } else this.awaySince = 0;
@@ -351,10 +356,16 @@ export class PitchTracker {
 
   /** the note in progress ends (at `until` in the run, or at the stretch's end) */
   private closeNote(until = this.run.length): void {
-    const r = (this.run.length ? readNote(this.run.slice(this.noteFrom, until)) : null) ?? this.current;
+    const r = (this.run.length ? this.timed(readNote(this.run.slice(this.noteFrom, until))) : null) ?? this.current;
     if (r && r.seconds >= 0.6) this.held = r;
     this.current = null;
     this.readAt = -1e9;
+  }
+
+  /** a reading's length from the note's real start, however much of it is still kept */
+  private timed(r: NoteReading | null): NoteReading | null {
+    if (r && this.run.length && this.noteT0 < this.run[this.noteFrom].t) r.seconds += this.run[this.noteFrom].t - this.noteT0;
+    return r;
   }
 
   /** the note's centre now, in semitones (vibrato averaged out); null without a pitch */
@@ -376,6 +387,11 @@ export class PitchTracker {
   /** The note in progress, once its body is long enough to read; otherwise the last note held. */
   get note(): NoteReading | null {
     return this.current ?? this.held;
+  }
+
+  /** `note` is the note being sung (not the last one held) */
+  get noteLive(): boolean {
+    return this.current !== null && this.centre !== null;
   }
 
   /** a pitch is sounding */

@@ -24,6 +24,14 @@ export interface MicFrame {
 }
 
 const ORDER = 12;
+
+/**
+ * How many of the newest samples one frame analyses: 2048 at 44.1 kHz (46 ms) and 48 kHz (43 ms),
+ * and as long in time at a lower rate (743 at 16 kHz, a Bluetooth headset's microphone; 1115 at
+ * 24 kHz). 2048 samples at 16 kHz would be 128 ms: long enough to smear a vibrato to a third of
+ * its swing, and to read the folds 10 points off where they read 6 (measured on the closure sweep).
+ */
+export const frameLength = (sampleRate: number): number => Math.min(2048, Math.round((sampleRate * 2048) / 44100));
 const firs = new Map<number, Float64Array>();
 
 /** windowed-sinc low-pass for decimating by `d` */
@@ -287,9 +295,10 @@ export class MicListener {
   read(): MicFrame | null {
     if (!this.node || !this.ctx) return null;
     this.node.getFloatTimeDomainData(this.buf);
-    const fr = analyse(this.buf, this.ctx.sampleRate);
+    const sr = this.ctx.sampleRate, x = this.buf.subarray(this.buf.length - frameLength(sr));
+    const fr = analyse(x, sr);
     // how the folds close, for a voice with a readable vowel
-    this.glottal = fr.voiced && fr.formants.length >= 2 ? glottalFeatures(this.buf, this.ctx.sampleRate, fr.f0, fr.formants) : null;
+    this.glottal = fr.voiced && fr.formants.length >= 2 ? glottalFeatures(x, sr, fr.f0, fr.formants) : null;
     return fr;
   }
 

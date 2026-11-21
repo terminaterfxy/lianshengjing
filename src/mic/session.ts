@@ -6,7 +6,7 @@
  * The page feeds it the microphone; `tools/mic-selftest.ts` feeds it rendered audio at a fixed
  * frame rate, so what is tested is what runs.
  */
-import { analyse, type MicFrame } from "./formants.ts";
+import { analyse, frameLength, type MicFrame } from "./formants.ts";
 import { glottalFeatures, openQuotient, type GlottalFeatures } from "./glottis.ts";
 import { SoundTracker, QUIET, type Heard } from "./track.ts";
 import { analyseOnset, BreathTracker, type Onset, type Steadiness } from "./breath.ts";
@@ -18,7 +18,7 @@ export interface Frame {
   glottal: GlottalFeatures | null;
 }
 
-/** One analysis frame from the newest ~43 ms of sound (what MicListener.read gives). */
+/** One analysis frame from the newest ~43 ms of sound, `frameLength` samples (what MicListener.read gives). */
 export function readFrame(samples: Float32Array, sampleRate: number): Frame {
   const fr = analyse(samples, sampleRate);
   return { fr, glottal: fr.voiced && fr.formants.length >= 2 ? glottalFeatures(samples, sampleRate, fr.f0, fr.formants) : null };
@@ -104,7 +104,7 @@ export class MicSession {
  * every frame. For tests and tools.
  */
 export function replay(session: MicSession, x: Float32Array, sampleRate: number, fps: number, each?: (tSeconds: number) => void): void {
-  const short = new Float32Array(2048), long = new Float32Array(32768);
+  const short = new Float32Array(frameLength(sampleRate)), long = new Float32Array(32768);
   const hop = sampleRate / fps;
   const fill = (buf: Float32Array, end: number) => {
     for (let i = 0; i < buf.length; i++) {

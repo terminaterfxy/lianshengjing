@@ -45,9 +45,9 @@ const TAB_KEY = "chimera.mic.tab";
 const loadTab = (): Tab => {
   try {
     const t = localStorage.getItem(TAB_KEY);
-    return t === "pitch" || t === "folds" || t === "breath" ? t : "mouth";
+    return t === "mouth" || t === "folds" || t === "breath" ? t : "pitch";
   } catch {
-    return "mouth";
+    return "pitch";
   }
 };
 
@@ -87,13 +87,14 @@ function LevelTrace(props: { get: () => { t: readonly number[]; db: readonly num
  * with the remembered take's note as a dashed line.
  */
 const NATURAL = [0, 2, 4, 5, 7, 9, 11];
-function PitchTrace(props: { get: () => { t: readonly number[]; m: readonly number[] } | null; refMidi: number | null }) {
+function PitchTrace(props: { get: () => { t: readonly number[]; m: readonly number[] } | null; refMidi: number | null; current: () => number | null }) {
   const propsRef = useRef(props);
   propsRef.current = props;
   const view = useRef<number | null>(null);
   const ref = usePhosphor(({ ctx, w, h, now, dt }) => {
     const x0 = 30, x1 = w - 8, top = 10, bot = h - 20, span = 10, half = 7.5;
-    const { get, refMidi } = propsRef.current;
+    const { get, refMidi, current } = propsRef.current;
+    const singing = current();
     const tr = get();
     const tNow = now / 1000;
     // the staff follows the voice: the median of the last three seconds, at once when it leaps
@@ -108,8 +109,10 @@ function PitchTrace(props: { get: () => { t: readonly number[]; m: readonly numb
     const y = (m: number) => top + (bot - top) * (0.5 - (m - c) / (2 * half));
     for (let m = Math.ceil(c - half); m <= Math.floor(c + half); m++) {
       const pc = ((m % 12) + 12) % 12, nat = NATURAL.includes(pc), yy = y(m);
-      seg(ctx, x0, yy, x1, yy, pc === 0 ? V.blueMid : V.blueDim, 0.8, nat ? { alpha: pc === 0 ? 1 : 0.75 } : { alpha: 0.45, dash: [2, 5] });
-      if (nat) label(ctx, noteOf(m), 3, yy + 3, { size: 9, color: TEXT.secondary, ls: 0.05 });
+      // the note being sung: its line lit, and named even when it is a black key
+      if (m === singing) seg(ctx, x0, yy, x1, yy, V.blue, 1.2);
+      else seg(ctx, x0, yy, x1, yy, pc === 0 ? V.blueMid : V.blueDim, 0.8, nat ? { alpha: pc === 0 ? 1 : 0.75 } : { alpha: 0.45, dash: [2, 5] });
+      if (nat || m === singing) label(ctx, noteOf(m), 3, yy + 3, { size: 9, color: m === singing ? V.blue : TEXT.secondary, ls: 0.05 });
     }
     if (refMidi !== null && Math.abs(refMidi - c) < half) {
       seg(ctx, x0, y(refMidi), x1, y(refMidi), V.white, 1, { dash: [6, 5], alpha: 0.8 });
@@ -175,7 +178,8 @@ function affineFor(cal: Calibration | null, m: VoiceModel): Affine | null {
 
 /** A closure the singer chose to remember: the closed share of the cycle, and the note it was sung on. */
 interface ClosureRef {
-  closed: number;
+  /** the closed share, % (absent when the take had no readable vowel: a hum, say) */
+  closed?: number;
   f0: number;
   /** how loud it was, dBFS: a reading only compares with one sung about as loud */
   level?: number;
@@ -187,6 +191,8 @@ interface ClosureRef {
   wobble?: number;
   vib?: Vibrato | null;
 }
+/** the reference's note as the pitch tab named it (its centre), else from the closure take's pitch */
+const refNote = (r: ClosureRef) => (r.midi != null ? noteOf(r.midi) : noteName(r.f0));
 const ONSET_WORD: Record<OnsetKind, string> = { soft: "软起音", hard: "硬起音", breathy: "气起音" };
 const ONSET_HINT: Record<OnsetKind, string> = { soft: "气和声同时到", hard: "声带先闭紧再撞开", breathy: "先漏气再出声" };
 const sdWord = (sd: number) => (sd <= 1 ? "很稳" : sd <= 2 ? "较稳" : "起伏大");
@@ -201,7 +207,7 @@ const REF_KEY = "chimera.mic.closureRef";
 function loadClosureRef(): ClosureRef | null {
   try {
     const r = JSON.parse(localStorage.getItem(REF_KEY) ?? "null") as ClosureRef | null;
-    return r && r.closed > 0 && r.f0 > 0 ? r : null;
+    return r && r.f0 > 0 && ((r.closed ?? 0) > 0 || (r.midi ?? 0) > 0) ? r : null;
   } catch {
     return null;
   }
@@ -282,8 +288,22 @@ export function MicPage() {
   // the note now (its centre, vibrato averaged out) and the note in progress or the last one held
   const [centre, setCentre] = useState<number | null>(null);
   const shownCentre = useRef<number | null>(null);
+  // the note named: it changes only once the voice is 60 cents from it, so a note sung half a
+  // semitone off is not named by turns as itself and its neighbour
+  const [shownNote, setShownNote] = useState<number | null>(null);
+  const shownNoteRef = useRef<number | null>(null);
   const centsMark = useRef<HTMLElement | null>(null);
   const [pitchNote, setPitchNote] = useState<NoteReading | null>(null);
+  const [pitchLive, setPitchLive] = useState(false);
+  const lastPitchAt = useRef(-1e9);
+  // a word of confirmation (remembered), for a moment
+  const [flash, setFlash] = useState<string | null>(null);
+  const flashTimer = useRef(0);
+  const say = (msg: string) => {
+    setFlash(msg);
+    window.clearTimeout(flashTimer.current);
+    flashTimer.current = window.setTimeout(() => setFlash(null), 3000);
+  };
   // The airflow simulation: the engine singing along, muted, to light the head and the tube with
   // pressure and flow. Off unless asked for: it is by far the heaviest thing on the page, and
   // every reading works without it.
@@ -364,6 +384,7 @@ export function MicPage() {
     let target: Pose = rest();
     let tipFree = true;
     let frames = 0, framesSince = performance.now();
+    let noteAwaySince: number | null = null;
     let lastAudio = performance.now();
     let affine: Affine | null = null, affineOf: Calibration | null | undefined = undefined, affineModel: VoiceModel | null = null;
     const loop = (now: number) => {
@@ -430,17 +451,29 @@ export function MicPage() {
         if (sc !== null) nowMark.current.style.left = `${clamp(((sc - CLOSED_LO) / (CLOSED_HI - CLOSED_LO)) * 100, 0, 100)}%`;
       }
       levelRef.current = session.level;
-      if (session.closed !== null && h.f0 > 0) lastTake.current = { at: now, closed: session.closed, f0: h.f0, level: session.level };
       steadyRef.current = session.steady;
       onsetRef.current = session.onset;
       // the pitch needle glides too (a new note jumps there)
       const pc = session.pitch.centre, ps = shownCentre.current;
+      // the take's note: the pitch tab's centre (one frame's pitch swings with the vibrato)
+      if (session.closed !== null && h.f0 > 0) lastTake.current = { at: now, closed: session.closed, f0: pc !== null ? 440 * 2 ** ((pc - 69) / 12) : h.f0, level: session.level };
       shownCentre.current = pc === null ? null : ps === null || Math.abs(pc - ps) > 0.5 ? pc : ps + (pc - ps) * Math.min(1, dt / 0.08);
-      if (centsMark.current) {
-        const sc = shownCentre.current;
-        centsMark.current.style.opacity = sc === null ? "0" : "1";
-        if (sc !== null) centsMark.current.style.left = `${clamp(50 + (sc - Math.round(sc)) * 100, 0, 100)}%`;
+      // the named note holds through small crossings of the boundary (no flicker), and moves when the
+      // centre is clearly past it, or has stayed past it for a quarter second (the first name was a coin toss)
+      const sc = shownCentre.current, sn = shownNoteRef.current;
+      const off = sc === null || sn === null ? 0 : Math.abs(sc - sn);
+      if (off <= 0.5) noteAwaySince = null;
+      else noteAwaySince ??= now;
+      if (sc === null) shownNoteRef.current = null;
+      else if (sn === null || off > 0.6 || (noteAwaySince !== null && now - noteAwaySince >= 250)) {
+        shownNoteRef.current = Math.round(sc);
+        noteAwaySince = null;
       }
+      if (centsMark.current) {
+        centsMark.current.style.opacity = sc === null ? "0" : "1";
+        if (sc !== null) centsMark.current.style.left = `${clamp(50 + (sc - shownNoteRef.current!) * 100, 0, 100)}%`;
+      }
+      if (session.pitch.note && sc !== null) lastPitchAt.current = now;
 
       const sounding = kind !== "silence";
       const voicedNow = kind === "vowel" || kind === "held";
@@ -483,11 +516,13 @@ export function MicPage() {
         setDeaf(deafRef.current);
         setClosed(shownClosed.current);
         setLevel(levelRef.current);
-        setCanRemember(!!lastTake.current && now - lastTake.current.at < 4000);
+        setCanRemember((!!lastTake.current && now - lastTake.current.at < 4000) || now - lastPitchAt.current < 4000);
         setSteady(steadyRef.current);
         setOnset(onsetRef.current);
         setCentre(shownCentre.current);
+        setShownNote(shownNoteRef.current);
         setPitchNote(session.pitch.note);
+        setPitchLive(session.pitch.noteLive);
         const r = rangeRun.current;
         if (r && r.hi > 0) setRanging([r.lo, r.hi]);
       }
@@ -520,6 +555,15 @@ export function MicPage() {
       setOn(false);
       setHeard(QUIET);
       heardRef.current = QUIET;
+      // the live needles go; what was read (the last note, the breath) stays
+      shownCentre.current = shownNoteRef.current = shownClosed.current = null;
+      setCentre(null);
+      setShownNote(null);
+      setClosed(null);
+      setPitchLive(false);
+      setCanRemember(false);
+      if (centsMark.current) centsMark.current.style.opacity = "0";
+      if (nowMark.current) nowMark.current.style.opacity = "0";
       st.setArtic({ ...rest() }, true);
       return false;
     }
@@ -593,11 +637,16 @@ export function MicPage() {
     }
     setRange(null);
   };
+  // the note being sung by name, steadied like the pitch tab's (raw pitch flips names on a vibrato near a boundary)
+  const nameNow = (hz: number) => (shownNoteRef.current !== null ? noteOf(shownNoteRef.current) : noteName(hz));
   const remember = () => {
-    const t = lastTake.current;
-    if (!t || performance.now() - t.at > 4000) return;
-    const p = sessionRef.current?.pitch.note ?? null;
-    const r: ClosureRef = { closed: t.closed, f0: t.f0, level: t.level ?? undefined, sd: steadyRef.current?.sd ?? undefined, onset: onsetRef.current?.kind, midi: p?.midi, wobble: p?.wobble ?? undefined, vib: p && p.seconds >= 1.1 ? p.vibrato : undefined };
+    const now = performance.now();
+    const t = lastTake.current && now - lastTake.current.at <= 4000 ? lastTake.current : null;
+    const p = now - lastPitchAt.current <= 4000 ? sessionRef.current?.pitch.note ?? null : null;
+    if (!t && !p) return;
+    const f0 = t?.f0 ?? 440 * 2 ** ((p!.midi - 69) / 12);
+    const r: ClosureRef = { closed: t?.closed, f0, level: t?.level ?? undefined, sd: steadyRef.current?.sd ?? undefined, onset: onsetRef.current?.kind, midi: p?.midi, wobble: p?.wobble ?? undefined, vib: p && p.seconds >= 1.1 ? p.vibrato : undefined };
+    say(`已记为参考（${refNote(r)}${r.closed != null ? ` · 闭合 ${Math.round(r.closed)}%` : ""}）。各页读数下面的“参考”就是这一次。`);
     try {
       localStorage.setItem(REF_KEY, JSON.stringify(r));
     } catch {
@@ -612,6 +661,7 @@ export function MicPage() {
       // nothing to remove
     }
     setMark(null);
+    say("参考已清除。");
   };
   const clearCalibration = () => {
     saveCalibration(null);
@@ -623,7 +673,7 @@ export function MicPage() {
     const h = heardRef.current;
     const lines = [`声道长 ${f.length.toFixed(1)} 厘米`, `口开 ${f.lipArea.toFixed(1)} cm²`];
     if (h.kind === "vowel") lines.push(`实测 F1 ${Math.round(h.F1)}`, `实测 F2 ${Math.round(h.F2)} Hz`);
-    if (h.f0 > 0) lines.push(`音高 ${noteName(h.f0)}`);
+    if (h.f0 > 0) lines.push(`音高 ${nameNow(h.f0)}`);
     if (tele && tele.t.pLung > 0.2) lines.push(`肺压 ${tele.t.pLung.toFixed(1)} cmH₂O`);
     return lines;
   };
@@ -643,8 +693,10 @@ export function MicPage() {
   const pos = (c: number) => clamp(((c - CLOSED_LO) / (CLOSED_HI - CLOSED_LO)) * 100, 0, 100);
   const high = heard.kind !== "silence" && heard.f0 > 450;
   const ref = calStep !== null ? REFS[calStep] : null;
-  const status = error ?? (on && deaf ? (deaf === "running" ? "没有收到声音：麦克风可能被别的应用占用（电话、录音、其他网页）。关掉它们，再点“停止”后重新“开始听”。" : "音频被系统暂停了：点一下屏幕任意位置即可恢复。") : ref ? `校准 ${calStep! + 1} / ${REFS.length}：用舒服的中低音唱“${ref.char}——”（${ref.hint}），保持约 2 秒。${heard.f0 > 350 ? "音有点高，低一些更准。" : ""}` : calMsg && heard.kind === "silence" ? calMsg : !on ? "点“开始听”，对着手机唱。长元音（啊、一、乌…）最清楚。" : heard.kind === "vowel" ? `${noteName(heard.f0)}${high ? "：音太高时口型测不准，仅供参考。" : ` · 实测共振峰 F1 ${Math.round(heard.F1)} · F2 ${Math.round(heard.F2)} Hz`}` : KIND_TEXT[heard.kind]);
-  const refLine = mark ? `参考：闭合 ${Math.round(mark.closed)}%（${noteName(mark.f0)}）${mark.sd != null ? ` · 起伏 ±${mark.sd.toFixed(1)} dB` : ""}${mark.onset ? ` · ${ONSET_WORD[mark.onset]}` : ""}` : null;
+  // what the bottom line says while listening: the mouth tab's own detail there, a plain word elsewhere
+  const listening = tab === "mouth" ? (heard.kind === "vowel" ? `${nameNow(heard.f0)}${high ? "：音太高时口型测不准，仅供参考。" : ` · 实测共振峰 F1 ${Math.round(heard.F1)} · F2 ${Math.round(heard.F2)} Hz`}` : KIND_TEXT[heard.kind]) : heard.kind === "silence" ? "正在听… 唱一个音。" : heard.kind === "vowel" || heard.kind === "held" ? "正在听。" : "听到辅音或气声：没有音高。";
+  const status = error ?? flash ?? (on && deaf ? (deaf === "running" ? "没有收到声音：麦克风可能被别的应用占用（电话、录音、其他网页）。关掉它们，再点“停止”后重新“开始听”。" : "音频被系统暂停了：点一下屏幕任意位置即可恢复。") : ref ? `校准 ${calStep! + 1} / ${REFS.length}：用舒服的中低音唱“${ref.char}——”（${ref.hint}），保持约 2 秒。${heard.f0 > 350 ? "音有点高，低一些更准。" : ""}` : calMsg && heard.kind === "silence" ? calMsg : !on ? "点“开始听”，对着手机唱。长元音（啊、一、乌…）最清楚。" : listening);
+  const refLine = mark ? `参考：${mark.closed != null ? `闭合 ${Math.round(mark.closed)}%（${refNote(mark)}）` : `${refNote(mark)}（那次没读到闭合）`}${mark.sd != null ? ` · 起伏 ±${mark.sd.toFixed(1)} dB` : ""}${mark.onset ? ` · ${ONSET_WORD[mark.onset]}` : ""}` : null;
   return (
     <div className="mic-page">
       <header className="mic-top">
@@ -679,7 +731,7 @@ export function MicPage() {
             <section className="mic-card mic-pitch" aria-label="音准">
               <header>
                 <h2>音准</h2>
-                <span className="mic-pitch-note">{centre === null ? "—" : noteOf(centre)}</span>
+                <span className="mic-pitch-note">{shownNote === null ? "—" : noteOf(shownNote)}</span>
               </header>
               <div className="mic-closure-bar" aria-hidden="true">
                 <i className="zone" style={{ left: "40%", width: "20%" }} />
@@ -691,14 +743,14 @@ export function MicPage() {
                 <span>准</span>
                 <span>偏高</span>
               </div>
-              <p>{centre === null ? "唱一个音，这里显示离它最近的音名，以及偏高还是偏低。" : `${centsText(100 * (centre - Math.round(centre)))} · ${(440 * 2 ** ((centre - 69) / 12)).toFixed(1)} Hz`}</p>
+              <p>{centre === null || shownNote === null ? (on ? "唱一个音，这里显示离它最近的音名，以及偏高还是偏低。" : "点下面的“开始听”，然后唱一个音。") : `${centsText(100 * (centre - shownNote))} · ${(440 * 2 ** ((centre - 69) / 12)).toFixed(1)} Hz`}</p>
             </section>
             <Screen className="mic-pitch-trace" title="音高曲线" sub="最近 10 秒 · 横线是半音">
-              <PitchTrace get={() => sessionRef.current?.pitch.trace ?? null} refMidi={mark ? mark.midi ?? midiOf(mark.f0) : null} />
+              <PitchTrace get={() => sessionRef.current?.pitch.trace ?? null} refMidi={mark ? mark.midi ?? midiOf(mark.f0) : null} current={() => shownNoteRef.current} />
             </Screen>
             <section className="mic-card mic-breath" aria-label="这个音">
               <header>
-                <h2>这个音</h2>
+                <h2>{pitchNote && !pitchLive ? "上一个长音" : "这个音"}</h2>
                 <span className="mic-breath-secs">{pitchNote ? `${pitchNote.seconds.toFixed(1)} 秒` : "—"}</span>
               </header>
               <dl>
@@ -809,7 +861,7 @@ export function MicPage() {
               </header>
               <div className="mic-closure-bar" aria-hidden="true">
                 <i className="zone" style={{ left: `${pos(26)}%`, width: `${pos(40) - pos(26)}%` }} />
-                {mark && <i className="mark" style={{ left: `${pos(mark.closed)}%` }} />}
+                {mark?.closed != null && <i className="mark" style={{ left: `${pos(mark.closed)}%` }} />}
                 <i className="now" ref={nowMark} style={{ opacity: 0 }} />
               </div>
               <div className="mic-closure-scale" aria-hidden="true">
@@ -820,9 +872,9 @@ export function MicPage() {
               <p>
                 {closed === null
                   ? "唱一个长元音，这里显示每个振动周期里声带合拢的时间占比（由声音估计）。"
-                  : `${closedWord(closed)}。${mark ? `现在${Math.abs(closed - mark.closed) < 3 ? "和参考差不多" : closed > mark.closed ? `比参考紧 ${Math.round(closed - mark.closed)} 点` : `比参考松 ${Math.round(mark.closed - closed)} 点`}。${loudGap !== null && Math.abs(loudGap) > 4 ? `但现在的音量比参考${loudGap > 0 ? "大" : "小"} ${Math.abs(Math.round(loudGap))} dB：力度不同，读数本身会差 3–4 点，请用相近的音量再比。` : ""}` : ""}`}
+                  : `${closedWord(closed)}。${mark?.closed != null ? `现在${Math.abs(closed - mark.closed) < 3 ? "和参考差不多" : closed > mark.closed ? `比参考紧 ${Math.round(closed - mark.closed)} 点` : `比参考松 ${Math.round(mark.closed - closed)} 点`}。${loudGap !== null && Math.abs(loudGap) > 4 ? `但现在的音量比参考${loudGap > 0 ? "大" : "小"} ${Math.abs(Math.round(loudGap))} dB：力度不同，读数本身会差 3–4 点，请用相近的音量再比。` : ""}` : ""}`}
               </p>
-              {refLine && <p className="mic-ref">白线 = {refLine}</p>}
+              {refLine && <p className="mic-ref">{mark?.closed != null ? "白线 = " : ""}{refLine}</p>}
             </section>
             <Screen className="mic-folds" title="声带" sub="俯视 · 慢放 · 开合和长短按你的声音">
               <Stroboscope
@@ -839,7 +891,7 @@ export function MicPage() {
                 {ranging
                   ? `正在记录音域：从你最低的音慢慢唱到最高的音，滑上去或一个一个唱都行。${ranging[1] > 0 ? `目前最低 ${noteName(ranging[0])}，最高 ${noteName(ranging[1])}。` : ""}唱完点“完成”。`
                   : heard.f0 > 0
-                    ? `声带拉长：比最低音时长约 ${Math.round(50 * stretchOf(heard.f0, body, range))}%（按音高 ${noteName(heard.f0)} 推算，${range ? `你的音域 ${noteName(range[0])}–${noteName(range[1])}` : "常见音域"}）`
+                    ? `声带拉长：比最低音时长约 ${Math.round(50 * stretchOf(heard.f0, body, range))}%（按音高 ${nameNow(heard.f0)} 推算，${range ? `你的音域 ${noteName(range[0])}–${noteName(range[1])}` : "常见音域"}）`
                     : `声带拉长：按音高推算，音越高拉得越长、越薄。${range ? `你的音域 ${noteName(range[0])}–${noteName(range[1])}。` : "录下你的音域后按你本人来算。"}`}
               </p>
               <div className="mic-actions">

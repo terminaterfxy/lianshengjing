@@ -51,6 +51,26 @@ function wav(file: string, pad = 0.6): { x: Float32Array; sr: number } {
 }
 const render = (...args: string[]) => execFileSync(cli, ["render", ...args], { stdio: "ignore" });
 const semis = (a: number, b: number) => 12 * Math.log2(a / b);
+/** to a lower sample rate (by an integer factor), through a windowed-sinc low-pass */
+function decimate(x: Float32Array, d: number): Float32Array {
+  const taps = 16 * d + 1, mid = (taps - 1) / 2, fc = 0.45 / d, h = new Float64Array(taps);
+  let sum = 0;
+  for (let i = 0; i < taps; i++) {
+    const t = i - mid;
+    h[i] = (t === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * t) / (Math.PI * t)) * (0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (taps - 1)));
+    sum += h[i];
+  }
+  const y = new Float32Array(Math.floor(x.length / d));
+  for (let j = 0; j < y.length; j++) {
+    let acc = 0;
+    for (let k = 0; k < taps; k++) {
+      const i = j * d + k - mid;
+      if (i >= 0 && i < x.length) acc += h[k] * x[i];
+    }
+    y[j] = acc / sum;
+  }
+  return y;
+}
 
 try {
   await initChimera(readFileSync(join(root, "src/wasm/chimera.wasm")));
@@ -137,6 +157,27 @@ try {
     // soft and loud singing only (the sweep's extremes), where the reading is known to run a few points tight and loose
     check(`${body}: closure, absolute`, mae < 0.055, `mean error ${(100 * mae).toFixed(1)} points of the cycle (limit 5.5)`);
     check(`${body}: closure, which of two takes is tighter`, right / pairs > 0.95, `${((100 * right) / pairs).toFixed(1)} % right of ${pairs} pairs (need 95 %)`);
+    // the same notes through a Bluetooth headset's 16 kHz microphone (a frame as long in time as
+    // at 44.1 kHz: 2048 samples there read 10 points off for a woman's voice)
+    {
+      let err = 0, n = 0;
+      for (const r of recs) {
+        const x = new Float32Array(r.len + 24000);
+        for (let i = 0; i < x.length; i++) x[i] = (Math.random() - 0.5) * 3e-4;
+        for (let i = 0; i < r.len; i++) x[24000 + i] += all[r.offset + i];
+        const s = new MicSession();
+        s.voice = body;
+        const est: number[] = [];
+        replay(s, decimate(x, 3), 16000, 60, (t) => {
+          if (s.oq !== null && t > 0.8) est.push(s.oq);
+        });
+        if (est.length) {
+          err += Math.abs(median(est) - r.oq);
+          n++;
+        }
+      }
+      check(`${body}: closure through a 16 kHz microphone`, n >= recs.length * 0.85 && err / n < 0.07, `mean error ${((100 * err) / n).toFixed(1)} points (limit 7), ${n} of ${recs.length} read`);
+    }
   }
 
   // ---- onsets: the engine's own, and what the classifier is told apart by
@@ -291,7 +332,7 @@ try {
   console.log("\npitch");
   // a sung /a/ whose pitch is known exactly (MIDI over time): harmonics under three formants, a
   // little breath noise, a quiet room before and after
-  const sung = (midi: (t: number) => number, dur: number, sr = 44100): Float32Array => {
+  const sung = (midi: (t: number) => number, dur: number, sr = 44100, breath = 0.02): Float32Array => {
     const pad = Math.round(0.6 * sr), n = Math.round(dur * sr), x = new Float32Array(n + 2 * pad);
     const formant = (f: number) => 1 / Math.hypot(1, (f - 750) / 120) + 0.6 / Math.hypot(1, (f - 1200) / 140) + 0.25 / Math.hypot(1, (f - 2700) / 200);
     let ph = 0;
@@ -301,7 +342,7 @@ try {
       const env = Math.min(1, t / 0.05, (dur - t) / 0.08);
       let s = 0;
       for (let k = 1; k * f < 5000; k++) s += (formant(k * f) / k ** 0.8) * Math.sin(2 * Math.PI * k * ph + k);
-      x[pad + i] = env * (0.075 * s + 0.02 * gauss());
+      x[pad + i] = env * (0.075 * s + breath * gauss());
     }
     for (let i = 0; i < x.length; i++) x[i] += 2e-4 * gauss();
     return x;
@@ -408,6 +449,35 @@ try {
       rows.push(`${c}c${rate ? ` vib ${rate}/±${ext}` : ""} → ${n ? `${n.cents.toFixed(1)}c, wander ±${n.wobble?.toFixed(1)}, drift ${n.drift?.toFixed(1)}${n.vibrato ? `, ${n.vibrato.rate.toFixed(1)} Hz ±${n.vibrato.extent.toFixed(0)}` : ""}` : "none"}`);
     }
     check("frames at uneven times", ok, `cents within 3, wander ≤ ±3, drift within 5: ${rows.join("; ")}`);
+  }
+  // harder rooms and voices: a very breathy voice (the breath as loud as the tone), a live room
+  // with noise, and a Bluetooth or AirPods microphone (16 and 24 kHz)
+  {
+    const truths: [number, number, number, number][] = [[67, -15, 5.8, 40], [57, 20, 0, 0], [72, 8, 6.5, 70], [43, -10, 0, 0], [52, 5, 5.5, 50]];
+    const voice = (m: number, c: number, rate: number, ext: number) => (t: number) => m + c / 100 + (ext / 100) * Math.sin(2 * Math.PI * rate * t) * Math.min(1, t / 0.3);
+    const conditions: [string, (m: number, c: number, rate: number, ext: number) => { x: Float32Array; sr: number }][] = [
+      ["a very breathy voice (breath as loud as the tone)", (m, c, r, e) => ({ x: sung(voice(m, c, r, e), 3, 44100, 0.15), sr: 44100 })],
+      ["a live room (RT60 0.5 s) with noise (SNR 25 dB)", (m, c, r, e) => ({ x: inRoom(sung(voice(m, c, r, e), 3), 44100, 0.5, 10, 25), sr: 44100 })],
+      ["a 24 kHz microphone (AirPods)", (m, c, r, e) => ({ x: decimate(sung(voice(m, c, r, e), 3, 48000), 2), sr: 24000 })],
+      ["a 16 kHz microphone (Bluetooth headset)", (m, c, r, e) => ({ x: decimate(sung(voice(m, c, r, e), 3, 48000), 3), sr: 16000 })],
+    ];
+    for (const [name, make] of conditions) {
+      const rows: string[] = [];
+      let ok = true;
+      for (const [m, c, rate, ext] of truths) {
+        const { x, sr } = make(m, c, rate, ext);
+        const r = pitchOf(x, 60, sr);
+        const good = !!r && Math.abs(100 * (r.midi - m) - c) <= 4 && Math.abs(r.drift ?? 99) < 8 && (rate ? !!r.vibrato && Math.abs(r.vibrato.rate - rate) <= 0.2 && Math.abs(r.vibrato.extent / ext - 1) <= 0.12 : !r.vibrato);
+        if (!good) ok = false;
+        rows.push(`${noteOf(m)}${c >= 0 ? "+" : ""}${c} → ${r ? `${noteOf(r.midi)}${r.cents >= 0 ? "+" : ""}${r.cents.toFixed(1)}${r.vibrato ? ` ${r.vibrato.rate.toFixed(1)} Hz ±${r.vibrato.extent.toFixed(0)}/${ext}` : ""}, drift ${r.drift?.toFixed(1)}` : "none"}`);
+      }
+      check(name, ok, `cents within 4, vibrato extent within 12 %, drift under 8: ${rows.join("; ")}`);
+    }
+  }
+  // a note held 15 s: its length counts from its start, though only its last 12 s are kept
+  {
+    const r = pitchOf(sung((t) => 65 + 0.4 * Math.sin(2 * Math.PI * 5.5 * t) * Math.min(1, t / 0.3), 15), 60);
+    check("a note held 15 s", !!r && Math.abs(r.seconds - 15) < 0.3 && !!r.vibrato, r ? `${r.seconds.toFixed(1)} s` : "none");
   }
   // a display too slow to see a vibrato (5 frames a second) gives no reading, not a wrong one
   {
