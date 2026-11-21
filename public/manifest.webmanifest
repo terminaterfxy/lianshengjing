@@ -1,0 +1,13 @@
+{
+  "name": "练声镜",
+  "short_name": "练声镜",
+  "description": "对着手机唱，看口型、声带闭合和气息。基于 CHIMERA 的物理声道模型。",
+  "lang": "zh-CN",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [{ "src": "apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any" }]
+}
