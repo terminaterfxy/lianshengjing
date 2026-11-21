@@ -7,7 +7,8 @@
  *
  * What it checks: vowel formants, calibration to another voice, which sounds are recognised, the
  * fold closure (against the engine's own glottis), onsets (plain, glottal, with h), the steadiness
- * of a held note, a range sung as a scale, and that none of it depends on the frame rate. Its
+ * of a held note, a range sung as a scale, the pitch (note, cents, vibrato, drift: on voices whose
+ * pitch is known exactly, and the engine's), and that none of it depends on the frame rate. Its
  * audio goes in a temporary folder that it deletes. It tests the method on the engine's voices;
  * a real voice through a real phone is the test it cannot make.
  */
@@ -19,8 +20,9 @@ import { fileURLToPath } from "node:url";
 import { analyse } from "../src/mic/formants.ts";
 import { applyAffine, calibrationProblem, fitAffine, type Calibration } from "../src/mic/calibrate.ts";
 import { analyseOnset } from "../src/mic/breath.ts";
-import { MicSession, replay } from "../src/mic/session.ts";
+import { MicSession, readFrame, replay } from "../src/mic/session.ts";
 import { RangeRecorder } from "../src/mic/range.ts";
+import { noteOf, PitchTracker } from "../src/mic/pitch.ts";
 import { initChimera, call } from "../src/wasm/chimera.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -284,6 +286,141 @@ try {
   const rr = new RangeRecorder();
   for (let i = 0; i < 600; i++) rr.feed(i * 16.7, i % 37 === 0 ? 1500 : i % 11 === 0 ? 90 : 0);
   check("stray pitches are not a range", rr.range === null, "isolated misread frames record nothing");
+
+  // ---- pitch: the note, how far off, the vibrato, the centre's drift
+  console.log("\npitch");
+  // a sung /a/ whose pitch is known exactly (MIDI over time): harmonics under three formants, a
+  // little breath noise, a quiet room before and after
+  const sung = (midi: (t: number) => number, dur: number, sr = 44100): Float32Array => {
+    const pad = Math.round(0.6 * sr), n = Math.round(dur * sr), x = new Float32Array(n + 2 * pad);
+    const formant = (f: number) => 1 / Math.hypot(1, (f - 750) / 120) + 0.6 / Math.hypot(1, (f - 1200) / 140) + 0.25 / Math.hypot(1, (f - 2700) / 200);
+    let ph = 0;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr, f = 440 * 2 ** ((midi(t) - 69) / 12);
+      ph += f / sr;
+      const env = Math.min(1, t / 0.05, (dur - t) / 0.08);
+      let s = 0;
+      for (let k = 1; k * f < 5000; k++) s += (formant(k * f) / k ** 0.8) * Math.sin(2 * Math.PI * k * ph + k);
+      x[pad + i] = env * (0.075 * s + 0.02 * gauss());
+    }
+    for (let i = 0; i < x.length; i++) x[i] += 2e-4 * gauss();
+    return x;
+  };
+  const pitchOf = (x: Float32Array, fps: number, sr = 44100) => {
+    const s = new MicSession();
+    replay(s, x, sr, fps);
+    return s.pitch.note;
+  };
+  for (const fps of [60, 30, 20]) {
+    // straight notes, in tune and off by a known amount, A3 to A5
+    const straight = ([[67, 0], [67, 20], [64, -35], [57, 12], [79, -8], [81, 5]] as const).map(([m, c]) => {
+      const r = pitchOf(sung(() => m + c / 100, 3), fps);
+      return { ok: !!r && Math.round(r.midi) === m && Math.abs(r.cents - c) <= 3 && !r.vibrato, txt: `${noteOf(m)}${c >= 0 ? "+" : ""}${c} → ${r ? `${noteOf(r.midi)}${r.cents >= 0 ? "+" : ""}${r.cents.toFixed(1)}` : "none"}` };
+    });
+    check(`straight notes, ${fps} fps`, straight.every((s) => s.ok), `note and cents within 3 of the truth, no vibrato: ${straight.map((s) => s.txt).join(", ")}`);
+    // vibrato: rate 4.5–7.5 Hz, ±25 to ±90 cents (it fades in over 0.3 s, as a singer's does)
+    let worstRate = 0, worstExt = 0, worstCentre = 0, missed = 0;
+    for (const rate of [4.5, 5.5, 6.5, 7.5])
+      for (const ext of [25, 50, 90]) {
+        const r = pitchOf(sung((t) => 67 + (ext / 100) * Math.sin(2 * Math.PI * rate * t) * Math.min(1, t / 0.3), 3.5), fps);
+        if (!r?.vibrato) {
+          missed++;
+          continue;
+        }
+        worstRate = Math.max(worstRate, Math.abs(r.vibrato.rate - rate));
+        worstExt = Math.max(worstExt, Math.abs(r.vibrato.extent / ext - 1));
+        worstCentre = Math.max(worstCentre, Math.abs(r.midi - 67) * 100);
+      }
+    check(`vibrato, ${fps} fps`, !missed && worstRate <= 0.2 && worstExt <= 0.1 && worstCentre <= 3, `12 kinds: ${missed} missed; worst rate error ${worstRate.toFixed(2)} Hz (limit 0.2), extent ${(100 * worstExt).toFixed(0)} % (limit 10), note's centre ${worstCentre.toFixed(1)} cents (limit 3)`);
+    // a note that sinks 40 cents over 4 s, with vibrato: the drift is read over its body (0.2 s
+    // after it starts to 0.15 s before it ends), so 36.5 of the 40
+    const sink = pitchOf(sung((t) => 65 + 0.4 * Math.sin(2 * Math.PI * 5.8 * t) * Math.min(1, t / 0.3) - 0.4 * (t / 4), 4), fps);
+    check(`a note sinking 40 cents, ${fps} fps`, !!sink && sink.drift !== null && Math.abs(sink.drift + 36.5) <= 5 && (sink.wobble ?? 9) < 3, sink ? `drift ${sink.drift?.toFixed(1)} cents (−36.5 ± 5), wander ±${sink.wobble?.toFixed(1)}` : "none");
+    // a legato scale, 0.8 s a note: each note read, in order, and nothing between them
+    const steps = [60, 62, 64, 65, 67, 69, 71, 72];
+    {
+      const s = new MicSession();
+      const seen: string[] = [];
+      replay(s, sung((t) => steps[Math.min(7, Math.floor(t / 0.8))], 6.4), 44100, fps, () => {
+        const r = s.pitch.note;
+        if (r && seen[seen.length - 1] !== noteOf(r.midi)) seen.push(noteOf(r.midi));
+      });
+      check(`a legato scale, ${fps} fps`, seen.join(" ") === steps.map(noteOf).join(" "), `notes read: ${seen.join(" ")}`);
+    }
+  }
+  // the engine's held notes: its own pitch wanders a few cents, its vibrato is 6 Hz at the set depth
+  {
+    const rows: string[] = [];
+    let ok = true;
+    for (const [body, m] of [["female", 67], ["male", 55]] as const)
+      for (const vib of [0, 35, 70]) {
+        writeFileSync(join(tmp, "n.json"), JSON.stringify({ bpm: 60, vibrato: vib, lyrics: "la", notes: [[m, 4]] }));
+        render("notes", join(tmp, "n.json"), join(tmp, "n"), body);
+        const { x, sr } = wav(join(tmp, "n.wav"));
+        for (const fps of [60, 30]) {
+          const r = pitchOf(x, fps, sr);
+          const good = !!r && Math.round(r.midi) === m && Math.abs(r.cents) <= 8 && (vib ? !!r.vibrato && Math.abs(r.vibrato.rate - 6) <= 0.3 && Math.abs(r.vibrato.extent / vib - 1) <= 0.15 : !r.vibrato);
+          if (!good) ok = false;
+          if (fps === 60 || !good) rows.push(`${body} vib ${vib}${fps === 60 ? "" : " @30"}: ${r ? `${noteOf(r.midi)}${r.cents >= 0 ? "+" : ""}${r.cents.toFixed(0)}${r.vibrato ? ` ${r.vibrato.rate.toFixed(1)} Hz ±${r.vibrato.extent.toFixed(0)}` : ""}` : "none"}`);
+        }
+      }
+    check("the engine's held notes", ok, rows.join("; "));
+  }
+  // a song with words: every note the page shows is one the melody has (two short notes the
+  // split misses must not show as the note between them)
+  {
+    const { x, sr } = wav(join(tmp, "song.wav"));
+    const melody = new Set(song.notes.filter((n) => n[0] > 0).map((n) => noteOf(n[0])));
+    for (const fps of [60, 30]) {
+      const s = new MicSession();
+      const shown: string[] = [];
+      replay(s, x, sr, fps, () => {
+        const r = s.pitch.note;
+        if (r && shown[shown.length - 1] !== noteOf(r.midi)) shown.push(noteOf(r.midi));
+      });
+      const stray = shown.filter((n) => !melody.has(n));
+      check(`a song with words, the notes shown, ${fps} fps`, !stray.length && shown.length >= 10, `${shown.length} shown, ${stray.length ? "not in the melody: " + stray.join(" ") : "all in the melody"}`);
+    }
+  }
+  // frames at uneven times (mostly 60 a second, some 30, a stall of 0.12–0.22 s one frame in 20):
+  // frames that bunch up must not read as the pitch wandering
+  {
+    const rows: string[] = [];
+    let ok = true;
+    for (const [rate, ext, c] of [[0, 0, -15], [5.5, 40, -15], [6.5, 80, 10]]) {
+      const x = sung((t) => 67 + c / 100 + (ext / 100) * Math.sin(2 * Math.PI * rate * t) * Math.min(1, t / 0.3), 3.5);
+      const s = new MicSession();
+      const buf = new Float32Array(2048), long = new Float32Array(32768);
+      for (let t = 0; ; ) {
+        const r = rnd(), dt = r < 0.75 ? 1 / 60 : r < 0.95 ? 1 / 30 : 0.12 + 0.1 * rnd();
+        t += dt;
+        const end = Math.round(t * 44100);
+        if (end > x.length) break;
+        for (let i = 0; i < buf.length; i++) buf[i] = x[end - buf.length + i] ?? 0;
+        s.step(t * 1000, dt, readFrame(buf, 44100), () => {
+          for (let i = 0; i < long.length; i++) long[i] = x[end - long.length + i] ?? 0;
+          return { samples: long, sampleRate: 44100 };
+        });
+      }
+      const n = s.pitch.note;
+      const good = !!n && Math.abs(100 * (n.midi - 67) - c) <= 3 && (n.wobble ?? 99) <= 3 && Math.abs(n.drift ?? 99) <= 5 && (rate ? !!n.vibrato && Math.abs(n.vibrato.rate - rate) <= 0.2 : !n.vibrato);
+      if (!good) ok = false;
+      rows.push(`${c}c${rate ? ` vib ${rate}/±${ext}` : ""} → ${n ? `${n.cents.toFixed(1)}c, wander ±${n.wobble?.toFixed(1)}, drift ${n.drift?.toFixed(1)}${n.vibrato ? `, ${n.vibrato.rate.toFixed(1)} Hz ±${n.vibrato.extent.toFixed(0)}` : ""}` : "none"}`);
+    }
+    check("frames at uneven times", ok, `cents within 3, wander ≤ ±3, drift within 5: ${rows.join("; ")}`);
+  }
+  // a display too slow to see a vibrato (5 frames a second) gives no reading, not a wrong one
+  {
+    const r = pitchOf(sung((t) => 67 + 0.5 * Math.sin(2 * Math.PI * 5.5 * t), 3), 5);
+    check("a 5 frames a second display", r === null, r ? `read ${noteOf(r.midi)} ${r.cents.toFixed(0)} cents, drift ${r.drift?.toFixed(0)}` : "no reading");
+  }
+  // the detector slipping an octave for a frame or two: the note's reading does not move
+  {
+    const p = new PitchTracker();
+    for (let i = 0; i < 240; i++) p.feed(i * 16.7, i % 37 === 0 || i % 50 === 0 || i % 50 === 1 ? 440 : 220);
+    const r = p.note;
+    check("octave slips of one and two frames", !!r && noteOf(r.midi) === "A3" && Math.abs(r.cents) < 1, r ? `${noteOf(r.midi)} ${r.cents.toFixed(2)} cents` : "none");
+  }
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }

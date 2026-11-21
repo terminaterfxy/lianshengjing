@@ -29,7 +29,7 @@ function resample(x: Float32Array, from: number, to: number): Float32Array { if 
 const med = (a: number[]) => a.sort((p, q) => p - q)[a.length >> 1];
 const rows: any[] = []; let bad = 0;
 for (const r of recs) {
-  let x = Float32Array.from(all.subarray(r.offset, r.offset + r.len));
+  let x: Float32Array = Float32Array.from(all.subarray(r.offset, r.offset + r.len));
   const rt60 = [0, 0, 0.25, 0.25, 0.5][Math.floor(rnd() * 5)], drr = 6 + 10 * rnd();
   const snr = [60, 60, 40, 32, 25][Math.floor(rnd() * 5)], tilt = (rnd() - 0.5) * 1.2, rate = rnd() < 0.5 ? 48000 : 44100;
   if (rt60) x = reverb(x, rt60, drr);

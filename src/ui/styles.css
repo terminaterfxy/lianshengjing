@@ -2778,6 +2778,29 @@ input[type="range"]::-moz-range-thumb {
   min-height: 210px;
 }
 
+.mic-pitch-trace .screen-body {
+  height: 220px;
+  min-height: 220px;
+}
+
+.mic-pitch-note {
+  font-size: 34px;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--amber);
+}
+
+/* in tune: the middle of the cents bar */
+.mic-closure-bar .mid {
+  left: 50%;
+  width: 2px;
+  margin-left: -1px;
+  top: -3px;
+  bottom: -3px;
+  background: var(--text-dim);
+}
+
 .mic-card {
   display: grid;
   gap: 8px;
@@ -2906,7 +2929,7 @@ input[type="range"]::-moz-range-thumb {
   letter-spacing: 0;
 }
 
-/* what to look at: one of three */
+/* what to look at: one at a time */
 .mic-tabs .segmented {
   display: flex;
   width: 100%;
