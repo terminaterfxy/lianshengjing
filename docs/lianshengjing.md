@@ -108,7 +108,10 @@
 
 ## 怎么构建、自测、发布
 
-这台机器上**没有 bun**，用 node + npm 代替；Rust 是用 Homebrew 的 rustup 装的。
+这台机器上**没有 bun**，用 node + npm 代替。
+**Rust 已在 2026-11-22 卸载**（为腾出 1.4 GB）：自测仍能跑，因为它只用 `target/release/` 里已经编好的
+`chimera`、`glottis_sweep`、`brightness_sweep`、`register_glide` 和 `src/wasm/chimera.wasm`（别删 `target`，约 64 MB）。
+要改引擎（Rust 代码）或重编这些工具时再装回来：`brew install rustup && rustup default stable && rustup target add wasm32-unknown-unknown`。
 
 ```bash
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
